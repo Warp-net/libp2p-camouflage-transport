@@ -31,13 +31,24 @@ resulting from the use or misuse of this software.
 // listener over a side-channel stream. The relay sees ciphertext only:
 // dialer and listener run their own libp2p security handshake inside the
 // forwarded stream.
+//
+// Wire format (deliberately tight, fixed-layout, JSON-free):
+//
+//	RegisterProtocol frame: [32-byte raw WarpID][2-byte BE sigLen][sig...]
+//	ResolveProtocol  frame: [32-byte raw WarpID]
+//	Status response:        [1 byte] 0x01=ok, anything else=denied
+//
+// The fixed prefix size makes framing trivial: readers consume exactly
+// the bytes for one message and never over-read into the byte-piping
+// phase that follows on the resolve channel.
 package aliasresolver
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -62,27 +73,21 @@ const (
 	StopProtocol protocol.ID = "/warpnet/alias-stop/0.0.0"
 )
 
-// statusOK is the one-line acknowledgement the relay writes after a
-// successful register or before the byte-piping phase of resolve.
-const statusOK = "ok"
+// Wire format constants.
+const (
+	WarpIDByteLen = 32
+	// MaxSigLen caps the signature length the resolver will accept on
+	// the register frame. Generous enough for RSA-4096 (~512 bytes); a
+	// hard ceiling stops a peer from making us allocate megabytes.
+	MaxSigLen = 1024
+
+	statusOK     = 0x01
+	statusDenied = 0x00
+)
 
 const (
 	handshakeTimeout = 10 * time.Second
-	maxFrameSize     = 4 * 1024
 )
-
-// RegisterRequest is the JSON payload sent by a listener over
-// RegisterProtocol. Sig is the libp2p crypto.PrivKey signature over the
-// raw bytes of ID and is verified against the stream's RemotePublicKey.
-type RegisterRequest struct {
-	ID  string `json:"id"`
-	Sig []byte `json:"sig"`
-}
-
-// ResolveRequest is sent by a dialer over ResolveProtocol.
-type ResolveRequest struct {
-	ID string `json:"id"`
-}
 
 // Entry is a single row of the resolver table.
 type Entry struct {
@@ -97,7 +102,7 @@ type Resolver struct {
 	host host.Host
 
 	mu    sync.RWMutex
-	table map[string]Entry
+	table map[string]Entry // key: hex WarpID
 }
 
 // New returns an unstarted Resolver. Call Start to wire up stream
@@ -134,12 +139,11 @@ func (r *Resolver) Lookup(id string) (Entry, bool) {
 	return e, ok
 }
 
-// HandleRegister processes one RegisterRequest from a listener.
-//
-// The stream's RemotePublicKey is the source of truth for ownership;
+// HandleRegister processes one register frame from a listener. The
+// stream's RemotePublicKey is the source of truth for ownership;
 // because the connection is libp2p-secure, the relay can trust it. The
 // signature ties the WarpID to the same key, ruling out third parties
-// who might capture and replay the JSON payload over their own connection.
+// who might capture and replay the payload over their own connection.
 func (r *Resolver) HandleRegister(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -151,19 +155,14 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 		return
 	}
 
-	var req RegisterRequest
-	if err := readJSON(s, &req); err != nil {
+	warpHex, sig, err := ReadRegisterFrame(s)
+	if err != nil {
 		log.Printf("aliasresolver: register decode from %s: %v", s.Conn().RemotePeer(), err)
 		_ = s.Reset()
 		return
 	}
 
-	if req.ID == "" || len(req.Sig) == 0 {
-		_ = s.Reset()
-		return
-	}
-
-	ok, err := pub.Verify([]byte(req.ID), req.Sig)
+	ok, err := pub.Verify([]byte(warpHex), sig)
 	if err != nil || !ok {
 		log.Printf("aliasresolver: register sig invalid from %s", s.Conn().RemotePeer())
 		_ = s.Reset()
@@ -173,16 +172,16 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 	remote := s.Conn().RemotePeer()
 
 	r.mu.Lock()
-	if e, exists := r.table[req.ID]; exists && !e.Owner.Equals(pub) {
+	if e, exists := r.table[warpHex]; exists && !e.Owner.Equals(pub) {
 		r.mu.Unlock()
 		log.Printf("aliasresolver: register conflict for id from %s", remote)
-		_ = s.Reset()
+		_ = WriteStatus(s, false)
 		return
 	}
-	r.table[req.ID] = Entry{Peer: remote, Owner: pub}
+	r.table[warpHex] = Entry{Peer: remote, Owner: pub}
 	r.mu.Unlock()
 
-	_ = writeStatus(s, statusOK)
+	_ = WriteStatus(s, true)
 }
 
 // HandleResolve looks up the listener for the requested WarpID, opens
@@ -191,24 +190,19 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 func (r *Resolver) HandleResolve(s network.Stream) {
 	_ = s.SetDeadline(time.Now().Add(handshakeTimeout))
 
-	br := bufio.NewReader(s)
-	var req ResolveRequest
-	if err := readJSONFrom(br, &req); err != nil {
+	warpHex, err := ReadResolveFrame(s)
+	if err != nil {
 		log.Printf("aliasresolver: resolve decode from %s: %v", s.Conn().RemotePeer(), err)
 		_ = s.Reset()
 		return
 	}
 
-	if req.ID == "" {
-		_ = s.Reset()
-		return
-	}
-
 	r.mu.RLock()
-	e, ok := r.table[req.ID]
+	e, ok := r.table[warpHex]
 	r.mu.RUnlock()
 	if !ok {
-		_ = s.Reset()
+		_ = WriteStatus(s, false)
+		_ = s.Close()
 		return
 	}
 
@@ -217,33 +211,32 @@ func (r *Resolver) HandleResolve(s network.Stream) {
 	cancel()
 	if err != nil {
 		log.Printf("aliasresolver: open stop stream to %s: %v", e.Peer, err)
-		_ = s.Reset()
+		_ = WriteStatus(s, false)
+		_ = s.Close()
 		return
 	}
 
-	if err := writeStatus(s, statusOK); err != nil {
+	if err := WriteStatus(s, true); err != nil {
 		_ = s.Reset()
 		_ = upstream.Reset()
 		return
 	}
 
-	// Clear the deadline so the long-lived data flow is not bounded by
+	// Clear deadlines so the long-lived data flow is not bounded by
 	// the handshake budget.
 	_ = s.SetDeadline(time.Time{})
 	_ = upstream.SetDeadline(time.Time{})
 
-	pipe(br, s, upstream)
+	pipe(s, upstream)
 }
 
-// pipe shuffles bytes between dialer (downBuf wrapping down) and upstream.
-// Reads from the dialer come from the buffered reader so any bytes
-// accidentally pulled into the buffer during the JSON parse are not lost.
-func pipe(downBuf io.Reader, down, up network.Stream) {
+// pipe shuffles bytes between the dialer (down) and the listener (up).
+func pipe(down, up network.Stream) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(up, downBuf)
+		_, _ = io.Copy(up, down)
 		_ = up.CloseWrite()
 	}()
 	go func() {
@@ -256,53 +249,101 @@ func pipe(downBuf io.Reader, down, up network.Stream) {
 	_ = up.Close()
 }
 
-// readJSON reads one newline-delimited JSON value from r. We use a
-// line-delimited framing rather than json.Decoder directly because the
-// decoder's internal buffering can swallow bytes that belong to a
-// subsequent piping phase.
-func readJSON(r io.Reader, v any) error {
-	br := bufio.NewReader(io.LimitReader(r, maxFrameSize))
-	return readJSONFrom(br, v)
-}
+// ---------- wire helpers (exported for the transport client) ----------
 
-func readJSONFrom(br *bufio.Reader, v any) error {
-	line, err := br.ReadBytes('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return err
-	}
-	if len(line) == 0 {
-		return io.ErrUnexpectedEOF
-	}
-	return json.Unmarshal(line, v)
-}
+// ErrInvalidWarpIDHex is returned when a WarpID string is not 64 hex chars.
+var ErrInvalidWarpIDHex = errors.New("aliasresolver: warp id must be 64 hex chars")
 
-// writeStatus sends a single newline-terminated status line.
-func writeStatus(w io.Writer, status string) error {
-	_, err := w.Write([]byte(status + "\n"))
-	return err
-}
-
-// WriteJSON is exported for use by client packages that share the wire
-// framing (line-delimited JSON).
-func WriteJSON(w io.Writer, v any) error {
-	b, err := json.Marshal(v)
+// WriteRegisterFrame serializes [warpID, sig] onto w. warpIDHex must
+// decode to exactly 32 bytes.
+func WriteRegisterFrame(w io.Writer, warpIDHex string, sig []byte) error {
+	idBytes, err := decodeWarpID(warpIDHex)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
-	_, err = w.Write(b)
+	if len(sig) > MaxSigLen {
+		return fmt.Errorf("aliasresolver: signature too long (%d > %d)", len(sig), MaxSigLen)
+	}
+	buf := make([]byte, 0, WarpIDByteLen+2+len(sig))
+	buf = append(buf, idBytes...)
+	var sigLen [2]byte
+	binary.BigEndian.PutUint16(sigLen[:], uint16(len(sig)))
+	buf = append(buf, sigLen[:]...)
+	buf = append(buf, sig...)
+	_, err = w.Write(buf)
 	return err
 }
 
-// ReadStatus reads one line and returns it without the trailing newline.
-// Errors are surfaced verbatim.
-func ReadStatus(r *bufio.Reader) (string, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+// ReadRegisterFrame parses one register frame and returns the WarpID
+// (hex) and signature.
+func ReadRegisterFrame(r io.Reader) (string, []byte, error) {
+	var idBytes [WarpIDByteLen]byte
+	if _, err := io.ReadFull(r, idBytes[:]); err != nil {
+		return "", nil, err
+	}
+	var sigLenBytes [2]byte
+	if _, err := io.ReadFull(r, sigLenBytes[:]); err != nil {
+		return "", nil, err
+	}
+	sigLen := int(binary.BigEndian.Uint16(sigLenBytes[:]))
+	if sigLen == 0 || sigLen > MaxSigLen {
+		return "", nil, fmt.Errorf("aliasresolver: sig length out of range: %d", sigLen)
+	}
+	sig := make([]byte, sigLen)
+	if _, err := io.ReadFull(r, sig); err != nil {
+		return "", nil, err
+	}
+	return hex.EncodeToString(idBytes[:]), sig, nil
+}
+
+// WriteResolveFrame serializes [warpID] onto w.
+func WriteResolveFrame(w io.Writer, warpIDHex string) error {
+	idBytes, err := decodeWarpID(warpIDHex)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(idBytes)
+	return err
+}
+
+// ReadResolveFrame parses one resolve frame and returns the WarpID (hex).
+func ReadResolveFrame(r io.Reader) (string, error) {
+	var idBytes [WarpIDByteLen]byte
+	if _, err := io.ReadFull(r, idBytes[:]); err != nil {
 		return "", err
 	}
-	if n := len(line); n > 0 && line[n-1] == '\n' {
-		line = line[:n-1]
+	return hex.EncodeToString(idBytes[:]), nil
+}
+
+// WriteStatus writes a single status byte: ok=true → 0x01, else 0x00.
+func WriteStatus(w io.Writer, ok bool) error {
+	b := byte(statusDenied)
+	if ok {
+		b = statusOK
 	}
-	return string(line), nil
+	_, err := w.Write([]byte{b})
+	return err
+}
+
+// ReadStatus reads one status byte; returns true iff it is 0x01.
+func ReadStatus(r io.Reader) (bool, error) {
+	var b [1]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return false, err
+	}
+	return b[0] == statusOK, nil
+}
+
+func decodeWarpID(s string) ([]byte, error) {
+	if len(s) != WarpIDByteLen*2 {
+		return nil, ErrInvalidWarpIDHex
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidWarpIDHex, err)
+	}
+	if len(b) != WarpIDByteLen {
+		return nil, ErrInvalidWarpIDHex
+	}
+	return b, nil
 }

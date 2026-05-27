@@ -4,7 +4,7 @@
 package aliasresolver_test
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -53,18 +53,13 @@ func TestRegisterRejectsBadSignature(t *testing.T) {
 	defer s.Close()
 
 	// Send a forged registration: the signature does not match the WarpID.
-	bad := aliasresolver.RegisterRequest{
-		ID:  "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-		Sig: []byte("not-a-real-signature"),
-	}
-	require.NoError(t, aliasresolver.WriteJSON(s, bad))
+	badID := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	require.NoError(t, aliasresolver.WriteRegisterFrame(s, badID, []byte("not-a-real-signature")))
 
-	// Relay resets the stream; reading status should give empty + EOF/closed.
-	br := bufio.NewReader(s)
-	status, _ := aliasresolver.ReadStatus(br)
-	require.NotEqual(t, "ok", status)
+	// Relay resets the stream after seeing the bad signature.
+	_, _ = aliasresolver.ReadStatus(s) // ignore error: stream may be reset
 
-	_, ok := r.Lookup(bad.ID)
+	_, ok := r.Lookup(badID)
 	require.False(t, ok, "forged registration must not appear in the table")
 }
 
@@ -84,11 +79,51 @@ func TestResolveUnknownIDFails(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	require.NoError(t, aliasresolver.WriteJSON(s, aliasresolver.ResolveRequest{
-		ID: "0000000000000000000000000000000000000000000000000000000000000000",
-	}))
+	require.NoError(t, aliasresolver.WriteResolveFrame(s,
+		"0000000000000000000000000000000000000000000000000000000000000000"))
 
-	br := bufio.NewReader(s)
-	status, _ := aliasresolver.ReadStatus(br)
-	require.NotEqual(t, "ok", status)
+	ok, _ := aliasresolver.ReadStatus(s)
+	require.False(t, ok)
+}
+
+func TestRegisterFrameRoundtrip(t *testing.T) {
+	id := "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	sig := []byte("signature-bytes")
+
+	var buf bytes.Buffer
+	require.NoError(t, aliasresolver.WriteRegisterFrame(&buf, id, sig))
+
+	gotID, gotSig, err := aliasresolver.ReadRegisterFrame(&buf)
+	require.NoError(t, err)
+	require.Equal(t, id, gotID)
+	require.Equal(t, sig, gotSig)
+}
+
+func TestResolveFrameRoundtrip(t *testing.T) {
+	id := "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
+	var buf bytes.Buffer
+	require.NoError(t, aliasresolver.WriteResolveFrame(&buf, id))
+
+	got, err := aliasresolver.ReadResolveFrame(&buf)
+	require.NoError(t, err)
+	require.Equal(t, id, got)
+}
+
+func TestWriteRegisterFrameRejectsBadHex(t *testing.T) {
+	var buf bytes.Buffer
+	err := aliasresolver.WriteRegisterFrame(&buf, "tooshort", []byte("sig"))
+	require.ErrorIs(t, err, aliasresolver.ErrInvalidWarpIDHex)
+}
+
+func TestReadRegisterFrameRejectsZeroSig(t *testing.T) {
+	id := "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
+	// Hand-craft a frame with sigLen=0.
+	var buf bytes.Buffer
+	require.NoError(t, aliasresolver.WriteResolveFrame(&buf, id)) // 32 bytes
+	buf.Write([]byte{0, 0})                                       // sigLen = 0
+
+	_, _, err := aliasresolver.ReadRegisterFrame(&buf)
+	require.Error(t, err)
 }

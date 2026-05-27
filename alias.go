@@ -37,12 +37,10 @@ resulting from the use or misuse of this software.
 package camouflage
 
 import (
-	"bufio"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
@@ -169,20 +167,19 @@ func (t *CamouflageTransport) openResolveStream(ctx context.Context, raddr ma.Mu
 		_ = s.SetDeadline(deadline)
 	}
 
-	if err := aliasresolver.WriteJSON(s, aliasresolver.ResolveRequest{ID: warpID}); err != nil {
+	if err := aliasresolver.WriteResolveFrame(s, warpID); err != nil {
 		_ = s.Reset()
 		return nil, fmt.Errorf("camouflage/alias: write resolve request: %w", err)
 	}
 
-	br := bufio.NewReader(s)
-	status, err := aliasresolver.ReadStatus(br)
+	ok, err := aliasresolver.ReadStatus(s)
 	if err != nil {
 		_ = s.Reset()
 		return nil, fmt.Errorf("camouflage/alias: read resolve status: %w", err)
 	}
-	if status != "ok" {
+	if !ok {
 		_ = s.Reset()
-		return nil, fmt.Errorf("camouflage/alias: relay refused resolve: %q", status)
+		return nil, fmt.Errorf("camouflage/alias: relay refused resolve for %s", warpID)
 	}
 
 	// Clear the handshake deadline before handing the stream off to
@@ -190,7 +187,7 @@ func (t *CamouflageTransport) openResolveStream(ctx context.Context, raddr ma.Mu
 	_ = s.SetDeadline(time.Time{})
 
 	local := buildAliasMultiaddr(relayID, t.warpID)
-	return newAliasStreamConn(s, br, local, raddr), nil
+	return newAliasStreamConn(s, local, raddr), nil
 }
 
 // listenAlias registers this peer's WarpID on the relay encoded in laddr
@@ -254,18 +251,17 @@ func (t *CamouflageTransport) registerOnRelay(ctx context.Context, relayID peer.
 		return fmt.Errorf("camouflage/alias: sign warpID: %w", err)
 	}
 
-	if err := aliasresolver.WriteJSON(s, aliasresolver.RegisterRequest{ID: t.warpID, Sig: sig}); err != nil {
+	if err := aliasresolver.WriteRegisterFrame(s, t.warpID, sig); err != nil {
 		_ = s.Reset()
 		return fmt.Errorf("camouflage/alias: write register request: %w", err)
 	}
 
-	br := bufio.NewReader(s)
-	status, err := aliasresolver.ReadStatus(br)
+	ok, err := aliasresolver.ReadStatus(s)
 	if err != nil {
 		return fmt.Errorf("camouflage/alias: read register status: %w", err)
 	}
-	if status != "ok" {
-		return fmt.Errorf("camouflage/alias: relay refused register: %q", status)
+	if !ok {
+		return fmt.Errorf("camouflage/alias: relay refused register")
 	}
 	return nil
 }
@@ -393,12 +389,12 @@ func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 // ---------- stream conn ----------
 
 // aliasStreamConn wraps a libp2p network.Stream as a manet.Conn so the
-// libp2p upgrader can run Noise + a stream muxer over it. The reader is
-// overridable because the resolve handshake leaves leftover bytes in a
-// bufio reader that must not be lost when piping begins.
+// libp2p upgrader can run Noise + a stream muxer over it. The binary
+// register/resolve framing has a deterministic length, so we read it
+// straight off the stream — no bufio.Reader, no leftover bytes to
+// shepherd into the data-piping phase.
 type aliasStreamConn struct {
 	stream network.Stream
-	reader io.Reader
 
 	local  ma.Multiaddr
 	remote ma.Multiaddr
@@ -406,19 +402,15 @@ type aliasStreamConn struct {
 
 var _ manet.Conn = (*aliasStreamConn)(nil)
 
-func newAliasStreamConn(s network.Stream, reader io.Reader, local, remote ma.Multiaddr) *aliasStreamConn {
-	if reader == nil {
-		reader = s
-	}
+func newAliasStreamConn(s network.Stream, local, remote ma.Multiaddr) *aliasStreamConn {
 	return &aliasStreamConn{
 		stream: s,
-		reader: reader,
 		local:  local,
 		remote: remote,
 	}
 }
 
-func (c *aliasStreamConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
+func (c *aliasStreamConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
 func (c *aliasStreamConn) Write(p []byte) (int, error) { return c.stream.Write(p) }
 func (c *aliasStreamConn) Close() error                { return c.stream.Close() }
 
@@ -494,7 +486,7 @@ func (l *aliasedListener) Accept() (manet.Conn, network.ConnManagementScope, err
 				_ = s.Reset()
 				continue
 			}
-			conn := newAliasStreamConn(s, nil, l.addr, l.addr)
+			conn := newAliasStreamConn(s, l.addr, l.addr)
 			return conn, scope, nil
 		case <-l.closed:
 			return nil, nil, transport.ErrListenerClosed

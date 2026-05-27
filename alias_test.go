@@ -4,7 +4,6 @@
 package camouflage_test
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -346,10 +345,10 @@ func TestRegisterSameOwnerIdempotent(t *testing.T) {
 
 	rs, err := listenerH.NewStream(ctx, relayH.ID(), aliasresolver.RegisterProtocol)
 	require.NoError(t, err)
-	require.NoError(t, aliasresolver.WriteJSON(rs, aliasresolver.RegisterRequest{ID: warpID, Sig: sig}))
-	br := bufio.NewReader(rs)
-	status, _ := aliasresolver.ReadStatus(br)
-	require.Equal(t, "ok", status)
+	require.NoError(t, aliasresolver.WriteRegisterFrame(rs, warpID, sig))
+	ok, err := aliasresolver.ReadStatus(rs)
+	require.NoError(t, err)
+	require.True(t, ok)
 	_ = rs.Close()
 
 	entry2, ok := resolver.Lookup(warpID)
