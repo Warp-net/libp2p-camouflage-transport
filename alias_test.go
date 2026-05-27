@@ -85,6 +85,48 @@ func connect(t *testing.T, src, dst host.Host) {
 	require.NoError(t, src.Connect(ctx, peer.AddrInfo{ID: dst.ID(), Addrs: dst.Addrs()}))
 }
 
+// TestPlainTCPDialUnaffectedByAliasMode verifies that hosts wired with
+// WithWarpID still dial each other directly over /ip4/.../tcp/... with
+// the normal DPI-camouflaged TCP path; the alias layer must not get in
+// the way of plain multiaddrs.
+func TestPlainTCPDialUnaffectedByAliasMode(t *testing.T) {
+	// Both hosts opt into alias mode but never talk through a relay.
+	listenerH := makeHost(t, freshWarpID(t))
+	dialerH := makeHost(t, freshWarpID(t))
+
+	listenerH.SetStreamHandler(echoProtoAlias, func(s network.Stream) {
+		defer s.Close()
+		_, _ = io.Copy(s, s)
+	})
+
+	// Dial via the listener's real /ip4/.../tcp/... address.
+	dialerH.Peerstore().AddAddrs(listenerH.ID(), listenerH.Addrs(), peerstore.PermanentAddrTTL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s, err := dialerH.NewStream(ctx, listenerH.ID(), echoProtoAlias)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Sanity: the stream really went through the camouflage transport,
+	// not a circuit-relay path. The connection's local/remote multiaddrs
+	// must carry /tcp/ and no /warpid/.
+	conn := s.Conn()
+	require.False(t, strings.Contains(conn.RemoteMultiaddr().String(), "/warpid/"),
+		"plain-TCP dial must not pick up a /warpid/ leg, got %s", conn.RemoteMultiaddr())
+	_, err = conn.RemoteMultiaddr().ValueForProtocol(ma.P_TCP)
+	require.NoError(t, err, "expected /tcp/ in RemoteMultiaddr %s", conn.RemoteMultiaddr())
+
+	payload := []byte("hello over plain tcp")
+	_, err = s.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, s.CloseWrite())
+
+	got, err := io.ReadAll(s)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
 // ---------- multiaddr / parser unit tests ----------
 
 func TestWarpIDProtocolRegistered(t *testing.T) {
