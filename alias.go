@@ -144,6 +144,12 @@ type aliasMode struct {
 	warpID   string         // empty => dial-only (cannot listen)
 	upgrader transport.Upgrader
 
+	// transport is held so the alias path can call wrapStack — the
+	// same SpoofConn + TLS-camouflage stack the direct TCP path
+	// applies — on the relayed stream before handing it to the
+	// upgrader. Alias never reads or writes any other transport field.
+	transport *CamouflageTransport
+
 	mu        sync.Mutex
 	listeners map[peer.ID]*aliasedListener // keyed by relay peer
 
@@ -157,8 +163,9 @@ type aliasMode struct {
 // also starts a background relay-finder that auto-Listens via every
 // peer it discovers speaking aliasresolver.RegisterProtocol — same
 // shape as libp2p's autorelay for circuit-v2.
-func newAliasMode(h host.Host, upgrader transport.Upgrader, warpID string) *aliasMode {
+func newAliasMode(t *CamouflageTransport, h host.Host, upgrader transport.Upgrader, warpID string) *aliasMode {
 	a := &aliasMode{
+		transport: t,
 		host:      h,
 		privKey:   h.Peerstore().PrivKey(h.ID()),
 		warpID:    warpID,
@@ -212,9 +219,21 @@ func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Mu
 		return nil, err
 	}
 
-	cc, err := a.upgrader.Upgrade(ctx, t, conn, network.DirOutbound, p, scope)
+	// Apply SpoofConn fragmentation + TLS camouflage to the proxied
+	// stream so the dialer↔listener leg through the relay carries the
+	// same DPI-evasion stack as a direct TCP+camouflage connection.
+	// Without this the inner Noise handshake would ride raw through
+	// the relay; an adversary controlling or observing the relay's
+	// plaintext side could fingerprint it.
+	camouflaged, err := a.transport.wrapStack(conn, true /* client */)
 	if err != nil {
-		_ = conn.Close()
+		scope.Done()
+		return nil, fmt.Errorf("camouflage/alias: wrap stack: %w", err)
+	}
+
+	cc, err := a.upgrader.Upgrade(ctx, t, camouflaged, network.DirOutbound, p, scope)
+	if err != nil {
+		_ = camouflaged.Close()
 		scope.Done()
 		return nil, err
 	}
@@ -697,7 +716,19 @@ func (l *aliasedListener) Accept() (manet.Conn, network.ConnManagementScope, err
 				_ = s.Reset()
 				continue
 			}
-			return newAliasStreamConn(s, l.addr, l.addr), scope, nil
+			inner := newAliasStreamConn(s, l.addr, l.addr)
+			// Server-side SpoofConn + TLS camouflage on the proxied
+			// stream — symmetric with the dialer's wrapStack(true) so
+			// the inner handshake actually completes. The upgrader
+			// (called by the framework after Accept returns) will run
+			// Noise on top of this.
+			camouflaged, err := l.a.transport.wrapStack(inner, false /* server */)
+			if err != nil {
+				log.Printf("camouflage/alias: wrap stack on accept: %v", err)
+				scope.Done()
+				continue
+			}
+			return camouflaged, scope, nil
 		case <-l.closed:
 			return nil, nil, transport.ErrListenerClosed
 		}

@@ -443,7 +443,7 @@ func (t *CamouflageTransport) enableAlias(h host.Host, warpID string) error {
 	if t.alias != nil {
 		return errors.New("camouflage/alias: already enabled")
 	}
-	t.alias = newAliasMode(h, t.upgrader, warpID)
+	t.alias = newAliasMode(t, h, t.upgrader, warpID)
 	return nil
 }
 
@@ -477,6 +477,23 @@ func (t *CamouflageTransport) String() string {
 
 func (t *CamouflageTransport) wrapConn(c manet.Conn) *SpoofConn {
 	return NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
+}
+
+// wrapStack applies the full DPI-evasion stack (SpoofConn fragmentation
+// + TLS camouflage) to a manet.Conn. The TCP-dial path inlines these
+// two steps; the alias-dial path uses this helper so the stream
+// proxied through a relay carries the same defenses as a direct
+// camouflage TCP connection. isClient selects between client-side
+// (uTLS browser fingerprint) and server-side (plausible cert chain)
+// camouflage configuration.
+func (t *CamouflageTransport) wrapStack(c manet.Conn, isClient bool) (manet.Conn, error) {
+	spoofed := NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
+	camouflaged, err := NewCamouflageConn(spoofed, isClient, t.camoConfig)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return camouflaged, nil
 }
 
 type camouflageGatedMaListener struct {
