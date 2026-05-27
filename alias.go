@@ -72,10 +72,21 @@ var AliasDialTimeout = 30 * time.Second
 
 var errInvalidWarpID = errors.New("warpid: invalid value")
 
-// init registers the /warpid/ multiaddr protocol. Identical
-// re-registration is harmless; the error is swallowed.
+// init registers the /warpid/ multiaddr protocol. If the code/name is
+// already taken by something else we panic so the misconfiguration is
+// caught at startup rather than producing mis-parsed multiaddrs later.
 func init() {
-	_ = ma.AddProtocol(ma.Protocol{
+	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code != 0 && existing.Name != WarpIDName {
+		panic(fmt.Sprintf("camouflage/alias: P_WARPID (%#x) already registered as %q", P_WARPID, existing.Name))
+	}
+	if existing := ma.ProtocolWithName(WarpIDName); existing.Code != 0 && existing.Code != P_WARPID {
+		panic(fmt.Sprintf("camouflage/alias: protocol name %q already registered with code %#x", WarpIDName, existing.Code))
+	}
+	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code == P_WARPID {
+		// Same package linked twice (e.g. via plugins). Nothing to do.
+		return
+	}
+	if err := ma.AddProtocol(ma.Protocol{
 		Name:  WarpIDName,
 		Code:  P_WARPID,
 		VCode: ma.CodeToVarint(P_WARPID),
@@ -83,7 +94,9 @@ func init() {
 		Transcoder: ma.NewTranscoderFromFunctions(
 			warpIDStrToBytes, warpIDBytesToStr, warpIDValidate,
 		),
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("camouflage/alias: register /warpid/: %v", err))
+	}
 }
 
 func warpIDStrToBytes(s string) ([]byte, error) {
@@ -149,7 +162,7 @@ func newAliasMode(h host.Host, upgrader transport.Upgrader, warpID string) *alia
 
 // canDial returns true only for well-formed alias dial multiaddrs.
 func (a *aliasMode) canDial(addr ma.Multiaddr) bool {
-	_, _, err := splitAliasDialAddr(addr)
+	_, _, _, err := splitAliasDialAddr(addr)
 	return err == nil
 }
 
@@ -158,9 +171,15 @@ func (a *aliasMode) canDial(addr ma.Multiaddr) bool {
 // only to satisfy the upgrader's transport.Transport parameter — the
 // alias layer never reads from it.
 func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
-	relayID, warpID, err := splitAliasDialAddr(raddr)
+	relayID, warpID, target, err := splitAliasDialAddr(raddr)
 	if err != nil {
 		return nil, err
+	}
+	// If the multiaddr embeds a /p2p/<target>, reject any mismatch with
+	// the caller's `p` early — letting it slip through would surface as
+	// an opaque upgrader/auth error several layers down.
+	if target != "" && target != p {
+		return nil, fmt.Errorf("camouflage/alias: dial multiaddr target %s != peer arg %s", target, p)
 	}
 
 	scope, err := a.host.Network().ResourceManager().OpenConnection(network.DirOutbound, false, raddr)
@@ -217,7 +236,15 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 	// the upgrader, which will run its own Noise handshake.
 	_ = s.SetDeadline(time.Time{})
 
-	local := buildAliasMultiaddr(relayID, a.warpID)
+	// Pick a non-empty label for the local multiaddr. Dial-only nodes
+	// (no WithWarpID) borrow the target's WarpID just so the resulting
+	// multiaddr is well-formed; identify still publishes the empty set
+	// because we never listen here.
+	localID := a.warpID
+	if localID == "" {
+		localID = warpID
+	}
+	local := buildAliasMultiaddr(relayID, localID)
 	return newAliasStreamConn(s, local, raddr), nil
 }
 
@@ -329,28 +356,47 @@ func (a *aliasMode) clear(l *aliasedListener) {
 // multiaddr helpers
 // ===========================================================================
 
-// splitAliasDialAddr extracts the relay peer.ID and warpID from a dial
-// multiaddr of the form .../p2p/<relay>/warpid/<id>[/p2p/<target>].
-func splitAliasDialAddr(a ma.Multiaddr) (peer.ID, string, error) {
-	warpComp, _, err := splitOnWarpID(a)
+// splitAliasDialAddr extracts the relay peer.ID, warpID, and optional
+// target peer.ID from a dial multiaddr of the form
+// .../p2p/<relay>/warpid/<id>[/p2p/<target>]. Anything past /warpid/
+// other than a single /p2p/<id> is rejected so CanDial cannot lure the
+// swarm into picking us for a malformed address.
+func splitAliasDialAddr(a ma.Multiaddr) (peer.ID, string, peer.ID, error) {
+	warpComp, tail, err := splitOnWarpID(a)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	prefix, _ := ma.SplitFunc(a, func(c ma.Component) bool {
 		return c.Protocol().Code == P_WARPID
 	})
 	if prefix == nil {
-		return "", "", fmt.Errorf("camouflage/alias: missing relay before /warpid/ in %s", a)
+		return "", "", "", fmt.Errorf("camouflage/alias: missing relay before /warpid/ in %s", a)
 	}
 	relayIDStr, err := prefix.ValueForProtocol(ma.P_P2P)
 	if err != nil {
-		return "", "", fmt.Errorf("camouflage/alias: no /p2p/<relayID> in %s", a)
+		return "", "", "", fmt.Errorf("camouflage/alias: no /p2p/<relayID> in %s", a)
 	}
 	relayID, err := peer.Decode(relayIDStr)
 	if err != nil {
-		return "", "", fmt.Errorf("camouflage/alias: invalid relay peer id %q: %w", relayIDStr, err)
+		return "", "", "", fmt.Errorf("camouflage/alias: invalid relay peer id %q: %w", relayIDStr, err)
 	}
-	return relayID, warpComp.Value(), nil
+
+	var target peer.ID
+	if tail != nil {
+		comps := ma.Split(tail)
+		if len(comps) != 1 || comps[0].Protocols()[0].Code != ma.P_P2P {
+			return "", "", "", fmt.Errorf("camouflage/alias: trailing components after /warpid/ must be a single /p2p/<id>, got %s", tail)
+		}
+		targetStr, err := comps[0].ValueForProtocol(ma.P_P2P)
+		if err != nil {
+			return "", "", "", fmt.Errorf("camouflage/alias: malformed /p2p/ tail in %s: %w", a, err)
+		}
+		target, err = peer.Decode(targetStr)
+		if err != nil {
+			return "", "", "", fmt.Errorf("camouflage/alias: invalid target peer id %q: %w", targetStr, err)
+		}
+	}
+	return relayID, warpComp.Value(), target, nil
 }
 
 // splitAliasListenAddr accepts /p2p/<relay>/warpid/<id> (no trailing /p2p/).
@@ -407,15 +453,19 @@ func splitOnWarpID(a ma.Multiaddr) (*ma.Component, ma.Multiaddr, error) {
 	return warpComp, tail, nil
 }
 
-// buildAliasMultiaddr returns /p2p/<relayID>/warpid/<warpID>.
+// buildAliasMultiaddr returns /p2p/<relayID>/warpid/<warpID>. Both
+// inputs are pre-validated by callers (relayID parsed from a multiaddr,
+// warpID checked for hex/length), so an error here means a programming
+// bug — surface it loudly instead of returning nil and causing a
+// nil-pointer panic far downstream.
 func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 	relay, err := ma.NewComponent("p2p", relayID.String())
 	if err != nil {
-		return nil
+		panic(fmt.Sprintf("camouflage/alias: bad relay peer id %q: %v", relayID, err))
 	}
 	wid, err := ma.NewComponent(WarpIDName, warpID)
 	if err != nil {
-		return nil
+		panic(fmt.Sprintf("camouflage/alias: bad warp id %q: %v", warpID, err))
 	}
 	return ma.Join(relay.Multiaddr(), wid.Multiaddr())
 }
@@ -482,17 +532,16 @@ func newAliasedListener(a *aliasMode, relayID peer.ID, warpID string) *aliasedLi
 }
 
 // deliver hands an inbound stream to a pending Accept. Returns false if
-// the listener has been closed.
+// the listener has been closed or its queue is saturated; in either
+// case the caller resets the stream so the relay isn't kept on the
+// hook waiting for bytes.
 func (l *aliasedListener) deliver(s network.Stream) bool {
 	select {
 	case <-l.closed:
 		return false
-	default:
-	}
-	select {
 	case l.incoming <- s:
 		return true
-	case <-l.closed:
+	default:
 		return false
 	}
 }

@@ -434,6 +434,27 @@ func TestListenWithoutWarpIDFails(t *testing.T) {
 	require.Error(t, err, "Listen must reject a /warpid/ address when no WarpID is configured")
 }
 
+// TestSplitAliasDialAddrRejectsGarbageTail verifies that a /warpid/
+// followed by anything other than nothing or a single /p2p/<id> is
+// rejected — otherwise CanDial would let the swarm pick this transport
+// for malformed addrs.
+func TestSplitAliasDialAddrRejectsGarbageTail(t *testing.T) {
+	relayH, _ := makeRelay(t)
+	dialerH := makeHost(t, "")
+	connect(t, dialerH, relayH)
+
+	tn, ok := dialerH.Network().(transport.TransportNetwork)
+	require.True(t, ok)
+
+	bad, err := ma.NewMultiaddr(
+		"/p2p/" + relayH.ID().String() + "/warpid/" + freshWarpID(t) + "/tcp/4001",
+	)
+	require.NoError(t, err)
+	require.Nil(t, tn.(interface {
+		TransportForDialing(ma.Multiaddr) transport.Transport
+	}).TransportForDialing(bad), "alias addr with /tcp/ tail must not dial")
+}
+
 // TestCanDialStructural exercises the structural validation in CanDial.
 // A bare /warpid/<id> without a preceding /p2p/<relayID> has no valid
 // dial path, so the swarm must not select us for it — verified through

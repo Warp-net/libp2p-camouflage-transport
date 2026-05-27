@@ -151,7 +151,10 @@ func WithHandshakeTimeout(d time.Duration) Option {
 // other aliased peers but cannot itself listen as one).
 func WithWarpID(warpID string) Option {
 	return func(t *CamouflageTransport) error {
-		t.warpID = warpID
+		// Lower-case so that signatures, table keys and multiaddr
+		// transcoding (hex.EncodeToString is always lower-case) all
+		// agree on the canonical form.
+		t.warpID = strings.ToLower(warpID)
 		return nil
 	}
 }
