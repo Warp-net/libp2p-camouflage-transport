@@ -25,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/core/transport"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
@@ -431,4 +432,30 @@ func TestListenWithoutWarpIDFails(t *testing.T) {
 	require.NoError(t, err)
 	err = dialerOnly.Network().Listen(listenAddr)
 	require.Error(t, err, "Listen must reject a /warpid/ address when no WarpID is configured")
+}
+
+// TestCanDialStructural exercises the structural validation in CanDial.
+// A bare /warpid/<id> without a preceding /p2p/<relayID> has no valid
+// dial path, so the swarm must not select us for it — verified through
+// TransportForDialing, which returns a nil transport when nothing can
+// handle the address.
+func TestCanDialStructural(t *testing.T) {
+	relayH, _ := makeRelay(t)
+	dialerH := makeHost(t, "")
+	connect(t, dialerH, relayH)
+
+	tn, ok := dialerH.Network().(transport.TransportNetwork)
+	require.True(t, ok, "swarm must implement transport.TransportNetwork")
+
+	good, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + freshWarpID(t))
+	require.NoError(t, err)
+	require.NotNil(t, tn.(interface {
+		TransportForDialing(ma.Multiaddr) transport.Transport
+	}).TransportForDialing(good), "swarm must accept a well-formed alias addr")
+
+	bad, err := ma.NewMultiaddr("/warpid/" + freshWarpID(t))
+	require.NoError(t, err)
+	require.Nil(t, tn.(interface {
+		TransportForDialing(ma.Multiaddr) transport.Transport
+	}).TransportForDialing(bad), "swarm must reject a /warpid/ with no relay prefix")
 }

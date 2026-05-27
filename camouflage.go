@@ -376,10 +376,14 @@ func (t *CamouflageTransport) Listen(laddr ma.Multiaddr) (transport.Listener, er
 }
 
 // CanDial returns true if the transport can dial the given multiaddr.
-// It accepts both bare TCP addresses and /warpid/ alias addresses.
+// For alias addresses the check is structural — we only return true
+// when the address actually decomposes into /<prefix-with-relay-p2p>
+// /warpid/<valid-id>[/p2p/<target>], so a malformed alias never selects
+// us out from under the swarm.
 func (t *CamouflageTransport) CanDial(addr ma.Multiaddr) bool {
 	if hasWarpID(addr) {
-		return true
+		_, _, err := splitAliasDialAddr(addr)
+		return err == nil
 	}
 	return t.inner.CanDial(addr)
 }
