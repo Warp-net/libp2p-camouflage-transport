@@ -188,9 +188,8 @@ type CamouflageTransport struct {
 	privKey crypto.PrivKey
 	warpID  string
 
-	aliasMu        sync.Mutex
-	aliasListeners map[peer.ID]*aliasedListener
-	aliasStarted   bool
+	aliasMu       sync.Mutex
+	aliasListener *aliasedListener // at most one Listen per transport
 }
 
 var _ transport.Transport = (*CamouflageTransport)(nil)
@@ -223,7 +222,6 @@ func NewCamouflageTransport(
 		sni:                defaultSNI,
 		browserFingerprint: defaultBrowserChrome,
 		handshakeTimeout:   defaultHandshakeTimeout,
-		aliasListeners:     make(map[peer.ID]*aliasedListener),
 	}
 	for _, o := range opts {
 		if err := o(t); err != nil {
@@ -253,7 +251,6 @@ func NewCamouflageTransport(
 	if t.host != nil {
 		t.privKey = t.host.Peerstore().PrivKey(t.host.ID())
 		t.host.SetStreamHandler(aliasresolver.StopProtocol, t.handleStopStream)
-		t.aliasStarted = true
 	}
 
 	return t, nil

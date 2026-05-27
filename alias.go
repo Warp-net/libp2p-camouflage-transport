@@ -209,17 +209,20 @@ func (t *CamouflageTransport) listenAlias(laddr ma.Multiaddr) (transport.Listene
 	}
 
 	t.aliasMu.Lock()
-	if _, exists := t.aliasListeners[relayID]; exists {
+	if t.aliasListener != nil {
+		existing := t.aliasListener.relayID
 		t.aliasMu.Unlock()
-		return nil, fmt.Errorf("camouflage/alias: already listening via relay %s", relayID)
+		return nil, fmt.Errorf("camouflage/alias: already listening via relay %s", existing)
 	}
 	l := newAliasedListener(t, relayID, warpID)
-	t.aliasListeners[relayID] = l
+	t.aliasListener = l
 	t.aliasMu.Unlock()
 
 	if err := t.registerOnRelay(context.Background(), relayID); err != nil {
 		t.aliasMu.Lock()
-		delete(t.aliasListeners, relayID)
+		if t.aliasListener == l {
+			t.aliasListener = nil
+		}
 		t.aliasMu.Unlock()
 		return nil, err
 	}
@@ -267,16 +270,16 @@ func (t *CamouflageTransport) registerOnRelay(ctx context.Context, relayID peer.
 }
 
 // handleStopStream is invoked when a relay opens an inbound stream for a
-// dialer it has resolved to us. Streams from peers we never registered
-// with are dropped.
+// dialer it has resolved to us. The sender must be the relay our active
+// listener registered with; streams from any other peer are dropped.
 func (t *CamouflageTransport) handleStopStream(s network.Stream) {
-	relay := s.Conn().RemotePeer()
+	remote := s.Conn().RemotePeer()
 
 	t.aliasMu.Lock()
-	l, ok := t.aliasListeners[relay]
+	l := t.aliasListener
 	t.aliasMu.Unlock()
-	if !ok {
-		log.Printf("camouflage/alias: stop stream from unregistered relay %s", relay)
+	if l == nil || l.relayID != remote {
+		log.Printf("camouflage/alias: stop stream from unexpected peer %s", remote)
 		_ = s.Reset()
 		return
 	}
@@ -285,11 +288,11 @@ func (t *CamouflageTransport) handleStopStream(s network.Stream) {
 	}
 }
 
-func (t *CamouflageTransport) removeAliasListener(relayID peer.ID, l *aliasedListener) {
+func (t *CamouflageTransport) clearAliasListener(l *aliasedListener) {
 	t.aliasMu.Lock()
 	defer t.aliasMu.Unlock()
-	if cur, ok := t.aliasListeners[relayID]; ok && cur == l {
-		delete(t.aliasListeners, relayID)
+	if t.aliasListener == l {
+		t.aliasListener = nil
 	}
 }
 
@@ -497,7 +500,7 @@ func (l *aliasedListener) Accept() (manet.Conn, network.ConnManagementScope, err
 func (l *aliasedListener) Close() error {
 	l.closeOnce.Do(func() {
 		close(l.closed)
-		l.t.removeAliasListener(l.relayID, l)
+		l.t.clearAliasListener(l)
 		// Drain any pending streams so they don't leak.
 		for {
 			select {
