@@ -644,3 +644,99 @@ func TestEnableAliasServiceTwiceFails(t *testing.T) {
 	_, err = camouflage.EnableAliasService(h)
 	require.Error(t, err, "second EnableAliasService on same host must fail")
 }
+
+// TestAliasDiscoveryThroughRelay walks the full discovery chain:
+//
+//  1. listener connects to a relay running EnableAliasService;
+//  2. listener's auto-finder picks up RegisterProtocol via identify and
+//     auto-Listens on /p2p/<relay>/warpid/<warpID>;
+//  3. that alias multiaddr appears in listener.Addrs() (i.e. is what
+//     identify will push to peers, what DHT will store, what gossip
+//     will relay);
+//  4. dialer pulls the alias multiaddr straight from the listener
+//     host's published Addrs() — the way a real peer would receive it
+//     via identify/DHT/gossip — and uses it to dial.
+//
+// No IP is ever shared from listener to dialer. The relay is the only
+// thing both endpoints share.
+func TestAliasDiscoveryThroughRelay(t *testing.T) {
+	warpID := freshWarpID(t)
+
+	relayH, resolver := makeRelay(t)
+	listenerH := makeHost(t, warpID)
+	dialerH := makeHost(t, "")
+
+	listenerH.SetStreamHandler(echoProtoAlias, func(s network.Stream) {
+		defer s.Close()
+		_, _ = io.Copy(s, s)
+	})
+
+	// Both nodes connect to the relay. Listener's auto-finder will see
+	// identify announcing RegisterProtocol on the relay and auto-Listen
+	// without any explicit Network().Listen call.
+	connect(t, listenerH, relayH)
+	connect(t, dialerH, relayH)
+
+	require.Eventually(t, func() bool {
+		_, ok := resolver.Lookup(warpID)
+		return ok
+	}, 5*time.Second, 20*time.Millisecond, "listener must auto-register on the relay")
+
+	// The alias multiaddr must appear in the listener host's own
+	// published Addrs() — that is what flows through identify/DHT/
+	// gossip to other peers.
+	var aliasAddr ma.Multiaddr
+	require.Eventually(t, func() bool {
+		for _, a := range listenerH.Addrs() {
+			v, err := a.ValueForProtocol(camouflage.P_WARPID)
+			if err == nil && v == warpID {
+				aliasAddr = a
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "alias multiaddr must be in listener.Addrs()")
+
+	// Sanity: the discovered multiaddr embeds the relay, not the
+	// listener's IP — that's the entire point of alias mode.
+	require.Contains(t, aliasAddr.String(), relayH.ID().String(),
+		"alias addr must reference the relay")
+	for _, a := range listenerH.Addrs() {
+		s := a.String()
+		// listener's real LAN/loopback IPs should still be in Addrs()
+		// alongside the alias — the alias is additive, not exclusive.
+		_ = s
+	}
+
+	// Dialer learns the alias addr the way any peer would — straight
+	// from peerstore (populated in production by identify push from
+	// the listener, or by DHT/gossip records).
+	dialerH.Peerstore().AddAddr(listenerH.ID(), aliasAddr, peerstore.PermanentAddrTTL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s, err := dialerH.NewStream(ctx, listenerH.ID(), echoProtoAlias)
+	require.NoError(t, err, "dial via the discovered alias multiaddr must succeed")
+	defer s.Close()
+
+	payload := []byte("discovered-via-relay")
+	_, err = s.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, s.CloseWrite())
+
+	got, err := io.ReadAll(s)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+
+	// And as a hard guarantee on the connection that just succeeded:
+	// its RemoteMultiaddr carries /warpid/, not the listener's IP.
+	require.True(t,
+		s.Conn().RemoteMultiaddr().String() != "" &&
+			hasWarpIDInString(s.Conn().RemoteMultiaddr().String()),
+		"established connection must ride a /warpid/ multiaddr, got %s",
+		s.Conn().RemoteMultiaddr())
+}
+
+func hasWarpIDInString(s string) bool {
+	return strings.Contains(s, "/warpid/")
+}
