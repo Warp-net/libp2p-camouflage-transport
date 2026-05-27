@@ -66,7 +66,11 @@ const (
 	statusDenied = 0x00
 )
 
-const handshakeTimeout = 10 * time.Second
+// HandshakeTimeout caps how long the relay waits for a single
+// register or resolve handshake to complete. Overridable from outside
+// for slow networks; not per-Resolver because all relays in a deployment
+// will share network conditions.
+var HandshakeTimeout = 10 * time.Second
 
 const DefaultMaxEntries = 10000
 const DefaultMaxBytesPerDirection int64 = 256 << 20
@@ -121,7 +125,7 @@ func (r *Resolver) Lookup(id string) (Entry, bool) {
 
 func (r *Resolver) HandleRegister(s network.Stream) {
 	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(handshakeTimeout))
+	_ = s.SetDeadline(time.Now().Add(HandshakeTimeout))
 
 	pub := s.Conn().RemotePublicKey()
 	if pub == nil {
@@ -171,7 +175,7 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 }
 
 func (r *Resolver) HandleResolve(s network.Stream) {
-	_ = s.SetDeadline(time.Now().Add(handshakeTimeout))
+	_ = s.SetDeadline(time.Now().Add(HandshakeTimeout))
 
 	warpHex, err := ReadResolveFrame(s)
 	if err != nil {
@@ -189,7 +193,7 @@ func (r *Resolver) HandleResolve(s network.Stream) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), HandshakeTimeout)
 	upstream, err := r.host.NewStream(ctx, e.Peer, StopProtocol)
 	cancel()
 	if err != nil {

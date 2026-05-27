@@ -61,13 +61,15 @@ var AliasDialTimeout = 30 * time.Second
 var errInvalidWarpID = errors.New("warpid: invalid value")
 
 func init() {
-	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code != 0 && existing.Name != WarpIDName {
-		panic(fmt.Sprintf("camouflage/alias: P_WARPID (%#x) already registered as %q", P_WARPID, existing.Name))
+	byCode := ma.ProtocolWithCode(P_WARPID)
+	byName := ma.ProtocolWithName(WarpIDName)
+	if byCode.Code != 0 && byCode.Name != WarpIDName {
+		panic(fmt.Sprintf("camouflage/alias: P_WARPID (%#x) already registered as %q", P_WARPID, byCode.Name))
 	}
-	if existing := ma.ProtocolWithName(WarpIDName); existing.Code != 0 && existing.Code != P_WARPID {
-		panic(fmt.Sprintf("camouflage/alias: protocol name %q already registered with code %#x", WarpIDName, existing.Code))
+	if byName.Code != 0 && byName.Code != P_WARPID {
+		panic(fmt.Sprintf("camouflage/alias: protocol name %q already registered with code %#x", WarpIDName, byName.Code))
 	}
-	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code == P_WARPID {
+	if byCode.Code == P_WARPID {
 		return
 	}
 	if err := ma.AddProtocol(ma.Protocol{
