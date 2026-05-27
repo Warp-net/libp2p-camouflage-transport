@@ -83,7 +83,6 @@ import (
 	"time"
 
 	camouflage "github.com/Warp-net/libp2p-camouflage-transport"
-	"github.com/Warp-net/libp2p-camouflage-transport/aliasresolver"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -179,8 +178,8 @@ func runRelay(args []string) {
 	must(err)
 	defer h.Close()
 
-	resolver := aliasresolver.New(h)
-	resolver.Start()
+	resolver, err := camouflage.EnableAliasService(h)
+	must(err)
 	defer resolver.Stop()
 
 	for _, a := range h.Addrs() {

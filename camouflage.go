@@ -36,6 +36,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Warp-net/libp2p-camouflage-transport/aliasresolver"
+
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -429,6 +431,30 @@ func (t *CamouflageTransport) enableAlias(h host.Host, warpID string) error {
 	}
 	t.alias = newAliasMode(h, t.upgrader, strings.ToLower(warpID))
 	return nil
+}
+
+// EnableAliasService turns this host into an alias-resolver relay: it
+// installs handlers for /warpnet/alias-register/0.0.0 and
+// /warpnet/alias-resolve/0.0.0, accepts signed registrations, and
+// proxies dialer streams onto registered listeners. Client peers
+// running EnableAlias discover us automatically through identify and
+// start Listening through us.
+//
+// This is the alias counterpart to libp2p.EnableRelayService for
+// circuit-v2: opt in only on the nodes that should actually serve as
+// alias relays (typically your bootstraps). Thin clients must not
+// call this.
+//
+// The returned *aliasresolver.Resolver lets callers inspect the table
+// or call Stop explicitly. Most setups can ignore it; the resolver's
+// stream handlers go inert once the host closes.
+func EnableAliasService(h host.Host) (*aliasresolver.Resolver, error) {
+	if h == nil {
+		return nil, errors.New("camouflage/alias: host is nil")
+	}
+	r := aliasresolver.New(h)
+	r.Start()
+	return r, nil
 }
 
 func (t *CamouflageTransport) String() string {

@@ -166,12 +166,13 @@ func makeHost(t *testing.T, warpID string) host.Host {
 
 // makeRelay wires CamouflageTransport on the relay too, so listeners
 // and dialers can reach it via the DPI-resistant TLS leg. The relay
-// itself never registers an alias.
+// itself never registers an alias — it just serves the resolver via
+// EnableAliasService, the alias counterpart of libp2p.EnableRelayService.
 func makeRelay(t *testing.T) (host.Host, *aliasresolver.Resolver) {
 	t.Helper()
 	h := makeHost(t, "")
-	r := aliasresolver.New(h)
-	r.Start()
+	r, err := camouflage.EnableAliasService(h)
+	require.NoError(t, err)
 	t.Cleanup(r.Stop)
 	return h, r
 }
