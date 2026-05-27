@@ -151,7 +151,7 @@ type aliasMode struct {
 	transport *CamouflageTransport
 
 	mu        sync.Mutex
-	listeners map[peer.ID]*aliasedListener // keyed by relay peer
+	listeners map[peer.ID]*streamListener // keyed by relay peer
 
 	finderCtx    context.Context
 	finderCancel context.CancelFunc
@@ -170,7 +170,7 @@ func newAliasMode(t *CamouflageTransport, h host.Host, upgrader transport.Upgrad
 		privKey:   h.Peerstore().PrivKey(h.ID()),
 		warpID:    warpID,
 		upgrader:  upgrader,
-		listeners: make(map[peer.ID]*aliasedListener),
+		listeners: make(map[peer.ID]*streamListener),
 	}
 	h.SetStreamHandler(aliasresolver.StopProtocol, a.handleStop)
 	h.Network().Notify(a)
@@ -213,22 +213,10 @@ func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Mu
 		return nil, err
 	}
 
-	conn, err := a.openResolveStream(ctx, raddr, relayID, warpID)
+	camouflaged, err := a.openResolveStream(ctx, raddr, relayID, warpID)
 	if err != nil {
 		scope.Done()
 		return nil, err
-	}
-
-	// Apply SpoofConn fragmentation + TLS camouflage to the proxied
-	// stream so the dialer↔listener leg through the relay carries the
-	// same DPI-evasion stack as a direct TCP+camouflage connection.
-	// Without this the inner Noise handshake would ride raw through
-	// the relay; an adversary controlling or observing the relay's
-	// plaintext side could fingerprint it.
-	camouflaged, err := a.transport.wrapStack(conn, true /* client */)
-	if err != nil {
-		scope.Done()
-		return nil, fmt.Errorf("camouflage/alias: wrap stack: %w", err)
 	}
 
 	cc, err := a.upgrader.Upgrade(ctx, t, camouflaged, network.DirOutbound, p, scope)
@@ -240,7 +228,7 @@ func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Mu
 	return cc, nil
 }
 
-func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, relayID peer.ID, warpID string) (*aliasStreamConn, error) {
+func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, relayID peer.ID, warpID string) (manet.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, AliasDialTimeout)
 	defer cancel()
 
@@ -279,7 +267,10 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 		localID = warpID
 	}
 	local := buildAliasMultiaddr(relayID, localID)
-	return newAliasStreamConn(s, local, raddr), nil
+	// Apply SpoofConn + TLS camouflage on the proxied stream so the
+	// dialer↔listener leg through the relay carries the same DPI-
+	// evasion stack as a direct TCP+camouflage connection.
+	return a.transport.wrapStreamStack(s, local, raddr, true /* client */)
 }
 
 // listen registers this peer's WarpID on the relay encoded in laddr and
@@ -302,21 +293,27 @@ func (a *aliasMode) listen(t transport.Transport, laddr ma.Multiaddr) (transport
 		return nil, fmt.Errorf("camouflage/alias: listen warpID %s != configured %s", warpID, a.warpID)
 	}
 
+	listenAddr := buildAliasMultiaddr(relayID, warpID)
+
 	a.mu.Lock()
 	if _, exists := a.listeners[relayID]; exists {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("camouflage/alias: already listening via relay %s", relayID)
 	}
-	l := newAliasedListener(a, relayID, warpID)
-	a.listeners[relayID] = l
+	sl := newStreamListener(relayID, listenAddr)
+	a.listeners[relayID] = sl
 	a.mu.Unlock()
 
 	if err := a.registerOnRelay(context.Background(), relayID); err != nil {
-		a.clear(l)
+		a.clear(sl)
 		return nil, err
 	}
 
-	return a.upgrader.UpgradeGatedMaListener(t, l), nil
+	// Run the proxied accepts through the same SpoofConn + TLS pipeline
+	// the TCP listener uses — no duplicated wrapping code in alias.
+	gated := a.upgrader.GateMaListener(sl)
+	camo := a.transport.newCamouflageAccept(gated)
+	return a.upgrader.UpgradeGatedMaListener(t, camo), nil
 }
 
 // registerOnRelay signs the WarpID with the host's private key and sends
@@ -379,7 +376,12 @@ func (a *aliasMode) handleStop(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
-	if !l.deliver(s) {
+	// Adapt the libp2p stream into a manet.Conn and hand it to the
+	// streamListener. The accept pipeline (camouflageGatedMaListener
+	// behind upgrader.UpgradeGatedMaListener) will wrap it with
+	// SpoofConn + TLS camouflage and then run Noise on top.
+	conn := &streamConn{stream: s, local: l.addr, remote: l.addr}
+	if !l.deliver(conn) {
 		_ = s.Reset()
 	}
 }
@@ -387,7 +389,7 @@ func (a *aliasMode) handleStop(s network.Stream) {
 // clear removes a listener from the active set if it still occupies the
 // slot for its relay. Called from the listener's Close path, the listen
 // failure path, and the relay-disconnect notifiee.
-func (a *aliasMode) clear(l *aliasedListener) {
+func (a *aliasMode) clear(l *streamListener) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if cur, ok := a.listeners[l.relayID]; ok && cur == l {
@@ -497,7 +499,8 @@ func (a *aliasMode) Disconnected(n network.Network, c network.Conn) {
 	l := a.listeners[p]
 	a.mu.Unlock()
 	if l != nil {
-		_ = l.Close() // also calls a.clear(l)
+		_ = l.Close()
+		a.clear(l)
 	}
 }
 
@@ -620,143 +623,80 @@ func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 }
 
 // ===========================================================================
-// stream conn + listener
+// streamListener — minimal manet.Listener whose Accept() pulls already-
+// adapted streamConn's from an in-memory queue. The alias path feeds it
+// from the stop-stream handler, then runs the standard
+// upgrader.GateMaListener → camouflageGatedMaListener →
+// UpgradeGatedMaListener pipeline on top — same SpoofConn + TLS
+// camouflage the direct TCP listener uses, no duplicated logic here.
 // ===========================================================================
 
-// aliasStreamConn wraps a libp2p network.Stream as a manet.Conn so the
-// libp2p upgrader can run Noise + a stream muxer over it.
-type aliasStreamConn struct {
-	stream network.Stream
-	local  ma.Multiaddr
-	remote ma.Multiaddr
-}
-
-var _ manet.Conn = (*aliasStreamConn)(nil)
-
-func newAliasStreamConn(s network.Stream, local, remote ma.Multiaddr) *aliasStreamConn {
-	return &aliasStreamConn{stream: s, local: local, remote: remote}
-}
-
-func (c *aliasStreamConn) Read(p []byte) (int, error)         { return c.stream.Read(p) }
-func (c *aliasStreamConn) Write(p []byte) (int, error)        { return c.stream.Write(p) }
-func (c *aliasStreamConn) Close() error                       { return c.stream.Close() }
-func (c *aliasStreamConn) LocalAddr() net.Addr                { return aliasNetAddr{label: c.local.String()} }
-func (c *aliasStreamConn) RemoteAddr() net.Addr               { return aliasNetAddr{label: c.remote.String()} }
-func (c *aliasStreamConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
-func (c *aliasStreamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
-func (c *aliasStreamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
-func (c *aliasStreamConn) LocalMultiaddr() ma.Multiaddr       { return c.local }
-func (c *aliasStreamConn) RemoteMultiaddr() ma.Multiaddr      { return c.remote }
-
-type aliasNetAddr struct{ label string }
-
-func (a aliasNetAddr) Network() string { return "libp2p-warpid" }
-func (a aliasNetAddr) String() string  { return a.label }
-
-// aliasedListener implements transport.GatedMaListener. The advertised
-// multiaddr is /p2p/<relayID>/warpid/<warpID>; no IP ever leaves this peer.
-type aliasedListener struct {
-	a       *aliasMode
+type streamListener struct {
 	relayID peer.ID
-	warpID  string
 	addr    ma.Multiaddr
 
-	incoming chan network.Stream
+	incoming chan manet.Conn
 
-	closeOnce sync.Once
-	closed    chan struct{}
-
-	// closeMu pairs with isClosed to serialise the "already closed?"
-	// check against an enqueue on l.incoming. Without it, a race in
-	// deliver's select (closed-channel ready AND buffer space ready)
-	// could let Go's randomised select enqueue a stream after Close.
 	closeMu  sync.Mutex
 	isClosed bool
+	closed   chan struct{}
 }
 
-var _ transport.GatedMaListener = (*aliasedListener)(nil)
+var _ manet.Listener = (*streamListener)(nil)
 
-func newAliasedListener(a *aliasMode, relayID peer.ID, warpID string) *aliasedListener {
-	return &aliasedListener{
-		a:        a,
+func newStreamListener(relayID peer.ID, addr ma.Multiaddr) *streamListener {
+	return &streamListener{
 		relayID:  relayID,
-		warpID:   warpID,
-		addr:     buildAliasMultiaddr(relayID, warpID),
-		incoming: make(chan network.Stream, 16),
+		addr:     addr,
+		incoming: make(chan manet.Conn, 16),
 		closed:   make(chan struct{}),
 	}
 }
 
-// deliver hands an inbound stream to a pending Accept. Returns false if
-// the listener has been closed or its queue is saturated; in either
-// case the caller resets the stream so the relay isn't kept on the
-// hook waiting for bytes. Holding closeMu around the closed-check and
-// the send avoids the select-randomisation race where deliver could
-// enqueue after Close.
-func (l *aliasedListener) deliver(s network.Stream) bool {
+// deliver enqueues an inbound conn for the next Accept. Holding closeMu
+// across the closed-check and the send rules out a select-randomisation
+// race where a stream could be enqueued after Close had drained.
+func (l *streamListener) deliver(c manet.Conn) bool {
 	l.closeMu.Lock()
 	defer l.closeMu.Unlock()
 	if l.isClosed {
 		return false
 	}
 	select {
-	case l.incoming <- s:
+	case l.incoming <- c:
 		return true
 	default:
 		return false
 	}
 }
 
-func (l *aliasedListener) Accept() (manet.Conn, network.ConnManagementScope, error) {
+func (l *streamListener) Accept() (manet.Conn, error) {
+	select {
+	case c := <-l.incoming:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *streamListener) Close() error {
+	l.closeMu.Lock()
+	if l.isClosed {
+		l.closeMu.Unlock()
+		return nil
+	}
+	l.isClosed = true
+	close(l.closed)
+	l.closeMu.Unlock()
 	for {
 		select {
-		case s := <-l.incoming:
-			scope, err := l.a.host.Network().ResourceManager().OpenConnection(network.DirInbound, false, l.addr)
-			if err != nil {
-				_ = s.Reset()
-				continue
-			}
-			inner := newAliasStreamConn(s, l.addr, l.addr)
-			// Server-side SpoofConn + TLS camouflage on the proxied
-			// stream — symmetric with the dialer's wrapStack(true) so
-			// the inner handshake actually completes. The upgrader
-			// (called by the framework after Accept returns) will run
-			// Noise on top of this.
-			camouflaged, err := l.a.transport.wrapStack(inner, false /* server */)
-			if err != nil {
-				log.Printf("camouflage/alias: wrap stack on accept: %v", err)
-				scope.Done()
-				continue
-			}
-			return camouflaged, scope, nil
-		case <-l.closed:
-			return nil, nil, transport.ErrListenerClosed
+		case c := <-l.incoming:
+			_ = c.Close()
+		default:
+			return nil
 		}
 	}
 }
 
-func (l *aliasedListener) Close() error {
-	l.closeOnce.Do(func() {
-		// Flip isClosed under closeMu so any concurrent deliver
-		// reads true before its enqueue attempt, then drop the lock
-		// before closing the channel / draining.
-		l.closeMu.Lock()
-		l.isClosed = true
-		l.closeMu.Unlock()
-
-		close(l.closed)
-		l.a.clear(l)
-		for {
-			select {
-			case s := <-l.incoming:
-				_ = s.Reset()
-			default:
-				return
-			}
-		}
-	})
-	return nil
-}
-
-func (l *aliasedListener) Multiaddr() ma.Multiaddr { return l.addr }
-func (l *aliasedListener) Addr() net.Addr          { return aliasNetAddr{label: l.addr.String()} }
+func (l *streamListener) Multiaddr() ma.Multiaddr { return l.addr }
+func (l *streamListener) Addr() net.Addr          { return streamNetAddr{label: l.addr.String()} }

@@ -496,6 +496,60 @@ func (t *CamouflageTransport) wrapStack(c manet.Conn, isClient bool) (manet.Conn
 	return camouflaged, nil
 }
 
+// wrapStreamStack is the same as wrapStack but takes a libp2p
+// network.Stream and the multiaddr metadata to attach to it. The alias
+// path uses streams (not raw TCP), so it needs this adapter to feed the
+// same SpoofConn + TLS pipeline.
+func (t *CamouflageTransport) wrapStreamStack(s network.Stream, local, remote ma.Multiaddr, isClient bool) (manet.Conn, error) {
+	return t.wrapStack(&streamConn{stream: s, local: local, remote: remote}, isClient)
+}
+
+// newCamouflageAccept wraps a GatedMaListener with the same
+// SpoofConn + TLS camouflage that the TCP Listen path uses. The alias
+// listener feeds it from an in-memory manet.Listener so accepted
+// proxied-via-relay streams get the same camouflage treatment as
+// directly-accepted TCP connections.
+func (t *CamouflageTransport) newCamouflageAccept(gated transport.GatedMaListener) transport.GatedMaListener {
+	return &camouflageGatedMaListener{
+		GatedMaListener: gated,
+		fragmentSize:    t.fragmentSize,
+		handshakeLen:    t.handshakeLen,
+		maxDelay:        t.maxDelay,
+		camoConfig:      t.camoConfig,
+	}
+}
+
+// streamConn adapts a libp2p network.Stream into a manet.Conn so the
+// SpoofConn / camouflageGatedMaListener pipeline can wrap it without
+// caring whether the bytes ride on raw TCP or on a relay-proxied
+// libp2p stream.
+type streamConn struct {
+	stream network.Stream
+	local  ma.Multiaddr
+	remote ma.Multiaddr
+}
+
+var _ manet.Conn = (*streamConn)(nil)
+
+func (c *streamConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
+func (c *streamConn) Write(p []byte) (int, error) { return c.stream.Write(p) }
+func (c *streamConn) Close() error                { return c.stream.Close() }
+
+func (c *streamConn) LocalAddr() net.Addr  { return streamNetAddr{label: c.local.String()} }
+func (c *streamConn) RemoteAddr() net.Addr { return streamNetAddr{label: c.remote.String()} }
+
+func (c *streamConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
+func (c *streamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
+func (c *streamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
+
+func (c *streamConn) LocalMultiaddr() ma.Multiaddr  { return c.local }
+func (c *streamConn) RemoteMultiaddr() ma.Multiaddr { return c.remote }
+
+type streamNetAddr struct{ label string }
+
+func (a streamNetAddr) Network() string { return "libp2p-warpid" }
+func (a streamNetAddr) String() string  { return a.label }
+
 type camouflageGatedMaListener struct {
 	transport.GatedMaListener
 
