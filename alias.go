@@ -399,12 +399,22 @@ func (a *aliasMode) handleStop(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
+	// Local = our advertised alias. Remote = the relay's connection
+	// multiaddr, so RemoteMultiaddr != LocalMultiaddr and accepts
+	// arriving via different relays land in distinct ResourceManager
+	// scopes. Falling back to l.addr only if the underlying conn
+	// somehow lacks a remote multiaddr (shouldn't happen for a live
+	// stream, but we don't want a nil here either).
+	remote := s.Conn().RemoteMultiaddr()
+	if remote == nil {
+		remote = l.addr
+	}
 	// Wrap the stream as a SpoofConn (which IS a manet.Conn) via the
 	// captured factory and hand it to the streamListener. The accept
 	// pipeline (camouflageGatedMaListener) calls NewSpoofConn again,
 	// but that's idempotent for *SpoofConn; the TLS camouflage wrap
 	// is then applied exactly once.
-	if !l.deliver(a.spoofStream(s, l.addr, l.addr)) {
+	if !l.deliver(a.spoofStream(s, l.addr, remote)) {
 		_ = s.Reset()
 	}
 }
