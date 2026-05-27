@@ -347,14 +347,18 @@ func TestRegisterConflictRejected(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 
 	// second's auto-finder will also try to register and be rejected
-	// (different owning key); give it time to run and then verify the
-	// table is still owned by first.
+	// (different owning key). require.Never polls for the duration we
+	// allow auto-finder to run and asserts the slot keeps belonging to
+	// first — no fixed Sleep, no flakiness across slow CI boxes.
 	connect(t, second, relayH)
-	time.Sleep(500 * time.Millisecond)
+	require.Never(t, func() bool {
+		e, ok := resolver.Lookup(warpID)
+		return !ok || e.Peer != first.ID()
+	}, 2*time.Second, 50*time.Millisecond, "first owner must continue to hold the slot")
 
 	entry, ok := resolver.Lookup(warpID)
 	require.True(t, ok)
-	require.Equal(t, first.ID(), entry.Peer, "first owner must still hold the slot")
+	require.Equal(t, first.ID(), entry.Peer)
 }
 
 func TestAliasManyConcurrentDials(t *testing.T) {

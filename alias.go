@@ -636,6 +636,13 @@ type aliasedListener struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// closeMu pairs with isClosed to serialise the "already closed?"
+	// check against an enqueue on l.incoming. Without it, a race in
+	// deliver's select (closed-channel ready AND buffer space ready)
+	// could let Go's randomised select enqueue a stream after Close.
+	closeMu  sync.Mutex
+	isClosed bool
 }
 
 var _ transport.GatedMaListener = (*aliasedListener)(nil)
@@ -654,11 +661,16 @@ func newAliasedListener(a *aliasMode, relayID peer.ID, warpID string) *aliasedLi
 // deliver hands an inbound stream to a pending Accept. Returns false if
 // the listener has been closed or its queue is saturated; in either
 // case the caller resets the stream so the relay isn't kept on the
-// hook waiting for bytes.
+// hook waiting for bytes. Holding closeMu around the closed-check and
+// the send avoids the select-randomisation race where deliver could
+// enqueue after Close.
 func (l *aliasedListener) deliver(s network.Stream) bool {
-	select {
-	case <-l.closed:
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+	if l.isClosed {
 		return false
+	}
+	select {
 	case l.incoming <- s:
 		return true
 	default:
@@ -684,6 +696,13 @@ func (l *aliasedListener) Accept() (manet.Conn, network.ConnManagementScope, err
 
 func (l *aliasedListener) Close() error {
 	l.closeOnce.Do(func() {
+		// Flip isClosed under closeMu so any concurrent deliver
+		// reads true before its enqueue attempt, then drop the lock
+		// before closing the channel / draining.
+		l.closeMu.Lock()
+		l.isClosed = true
+		l.closeMu.Unlock()
+
 		close(l.closed)
 		l.a.clear(l)
 		for {

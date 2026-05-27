@@ -36,14 +36,17 @@ resulting from the use or misuse of this software.
 //
 // All three node types share the same transport line:
 //
-//	libp2p.Transport(camouflage.NewCamouflageTransport,
-//	    camouflage.WithWarpID(myWarpID), // listener only
-//	)
+//	libp2p.Transport(camouflage.NewCamouflageTransport)
 //
-// The relay omits WithWarpID because it never registers itself as an
-// alias. The dialer omits it too — alias-mode dials work without a
-// local WarpID because the alias to resolve is encoded in the dial
-// multiaddr.
+// Alias mode is wired separately, after the host is built:
+//
+//	camouflage.EnableAlias(h, warpID)    // listener: non-empty warpID
+//	camouflage.EnableAlias(h, "")        // dialer:   empty (dial-only)
+//	camouflage.EnableAliasService(h)     // relay:    serve the resolver
+//
+// The relay-finder inside EnableAlias subscribes to identify and calls
+// Network().Listen automatically for every peer that speaks the
+// resolver protocols — no manual Listen call required.
 //
 // Three-terminal demo:
 //
@@ -188,10 +191,11 @@ func runRelay(args []string) {
 	waitForSignal()
 }
 
-// runListener configures CamouflageTransport with WithWarpID, connects
-// to the relay over the DPI-resistant TCP leg, and then calls
-// Network().Listen on the alias address. Once the relay accepts the
-// signed registration, the host publishes only the alias multiaddr.
+// runListener calls EnableAlias(h, warpID) and connects to the relay
+// over the DPI-resistant TCP leg. The transport's relay-finder then
+// observes the resolver protocols in identify and auto-Listens on the
+// alias address; once the relay accepts the signed registration, the
+// host publishes only the alias multiaddr.
 func runListener(args []string) {
 	fs := flag.NewFlagSet("listener", flag.ExitOnError)
 	relayAddr := fs.String("relay", "", "full multiaddr of the relay, including /p2p/<id>")

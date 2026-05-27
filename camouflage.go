@@ -29,6 +29,7 @@ package camouflage
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -402,6 +403,9 @@ func (t *CamouflageTransport) Proxy() bool {
 // lower-case hex so signatures, table keys and the multiaddr transcoder
 // all agree.
 func EnableAlias(h host.Host, warpID string) error {
+	if h == nil {
+		return errors.New("camouflage/alias: host is nil")
+	}
 	// TransportForDialing is a method on *swarm.Swarm but not part of
 	// the public transport.TransportNetwork interface; assert against
 	// the concrete shape we expect.
@@ -424,12 +428,22 @@ func EnableAlias(h host.Host, warpID string) error {
 }
 
 func (t *CamouflageTransport) enableAlias(h host.Host, warpID string) error {
+	warpID = strings.ToLower(warpID)
+	if warpID != "" {
+		if len(warpID) != WarpIDByteLen*2 {
+			return fmt.Errorf("camouflage/alias: warpID must be %d hex chars (got %d)", WarpIDByteLen*2, len(warpID))
+		}
+		if _, err := hex.DecodeString(warpID); err != nil {
+			return fmt.Errorf("camouflage/alias: warpID must be valid hex: %w", err)
+		}
+	}
+
 	t.aliasMu.Lock()
 	defer t.aliasMu.Unlock()
 	if t.alias != nil {
 		return errors.New("camouflage/alias: already enabled")
 	}
-	t.alias = newAliasMode(h, t.upgrader, strings.ToLower(warpID))
+	t.alias = newAliasMode(h, t.upgrader, warpID)
 	return nil
 }
 
