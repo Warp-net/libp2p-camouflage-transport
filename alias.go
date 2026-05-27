@@ -407,6 +407,16 @@ func (a *aliasMode) runRelayFinder() {
 			if !supportsRegisterProtocol(evt.Protocols) {
 				continue
 			}
+			// Only register through peers we have a real direct
+			// connection to. Limited connections are circuit-v2
+			// reservations with data/duration caps — opening a
+			// long-lived register stream over them just times out.
+			if evt.Conn != nil && evt.Conn.Stat().Limited {
+				continue
+			}
+			if a.host.Network().Connectedness(evt.Peer) != network.Connected {
+				continue
+			}
 			a.maybeAutoListen(evt.Peer)
 		}
 	}
