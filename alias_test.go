@@ -41,26 +41,23 @@ func freshWarpID(t *testing.T) string {
 	return hex.EncodeToString(b)
 }
 
-// makeHost spins up a libp2p host configured with CamouflageTransport.
-// When warpID is empty the host is alias-mode dial-only (relay & dialer
-// in the e2e tests use this).
+// makeHost spins up a libp2p host configured with CamouflageTransport
+// and turns on alias mode via the post-host EnableAlias call. An empty
+// warpID still enables the layer in dial-only mode.
 func makeHost(t *testing.T, warpID string) host.Host {
 	t.Helper()
 	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
 	require.NoError(t, err)
 
-	var opts []any
-	if warpID != "" {
-		opts = append(opts, camouflage.WithWarpID(warpID))
-	}
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
 		libp2p.DisableRelay(),
 		libp2p.Security(noise.ID, noise.New),
-		libp2p.Transport(camouflage.NewCamouflageTransport, opts...),
+		libp2p.Transport(camouflage.NewCamouflageTransport),
 	)
 	require.NoError(t, err)
+	require.NoError(t, camouflage.EnableAlias(h, warpID))
 	t.Cleanup(func() { _ = h.Close() })
 	return h
 }

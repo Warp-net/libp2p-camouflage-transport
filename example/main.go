@@ -138,20 +138,29 @@ run 'example <mode> -h' for the flags of a single mode.
 }
 
 // newHost builds a libp2p host whose TCP leg is CamouflageTransport.
-// When warpID is non-empty, the same transport also handles inbound and
-// outbound /warpid/ alias addresses.
+// Alias mode is enabled separately via camouflage.EnableAlias after the
+// host exists — the transport constructor itself does not take a host
+// (that would break libp2p's autonat-service dialer, whose fx graph
+// has no host.Host provider).
 func newHost(priv crypto.PrivKey, listen, warpID string) (host.Host, error) {
-	var opts []any
-	if warpID != "" {
-		opts = append(opts, camouflage.WithWarpID(warpID))
-	}
-	return libp2p.New(
+	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(listen),
 		libp2p.DisableRelay(),
 		libp2p.Security(noise.ID, noise.New),
-		libp2p.Transport(camouflage.NewCamouflageTransport, opts...),
+		libp2p.Transport(camouflage.NewCamouflageTransport),
 	)
+	if err != nil {
+		return nil, err
+	}
+	// Even a dial-only or relay node wires the alias layer so that
+	// resolve dials (no local warpID) still work. An empty warpID
+	// disables the listen path inside aliasMode.
+	if err := camouflage.EnableAlias(h, warpID); err != nil {
+		_ = h.Close()
+		return nil, err
+	}
+	return h, nil
 }
 
 // runRelay starts a libp2p host whose only job is to serve the alias
