@@ -26,6 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
@@ -39,6 +40,108 @@ func freshWarpID(t *testing.T) string {
 	_, err := rand.Read(b)
 	require.NoError(t, err)
 	return hex.EncodeToString(b)
+}
+
+// makeThinHost mirrors the warpdroid thin-client setup: no listen addrs,
+// only the camouflage TCP transport, circuit-v2 relay client enabled,
+// yamux muxer, identify-discovery disabled. Alias mode is wired up in
+// dial-only mode (empty WarpID) — the thin node only resolves other
+// peers' aliases, it never registers one of its own.
+func makeThinHost(t *testing.T) host.Host {
+	t.Helper()
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+
+	ya := yamux.DefaultTransport
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.NoTransports,
+		libp2p.NoListenAddrs,
+		libp2p.EnableRelay(),
+		libp2p.DisableIdentifyAddressDiscovery(),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Transport(camouflage.NewCamouflageTransport),
+		libp2p.Muxer(yamux.ID, ya),
+		libp2p.UserAgent("warpdroid-test"),
+	)
+	require.NoError(t, err)
+	require.NoError(t, camouflage.EnableAlias(h, ""))
+	t.Cleanup(func() { _ = h.Close() })
+	return h
+}
+
+// TestThinNodeDialsAliasListener spins up a relay, a fat alias-listener,
+// and a warpdroid-style thin client. The thin client never listens and
+// never registers a WarpID; it just dials the listener through the
+// relay using a /warpid/ multiaddr and exchanges one echo message.
+func TestThinNodeDialsAliasListener(t *testing.T) {
+	warpID := freshWarpID(t)
+
+	relayH, resolver := makeRelay(t)
+	listenerH := makeHost(t, warpID)
+	thinH := makeThinHost(t)
+
+	listenerH.SetStreamHandler(echoProtoAlias, func(s network.Stream) {
+		defer s.Close()
+		_, _ = io.Copy(s, s)
+	})
+
+	// Listener registers on the relay via alias listen.
+	connect(t, listenerH, relayH)
+	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
+	require.NoError(t, err)
+	require.NoError(t, listenerH.Network().Listen(listenAddr))
+	require.Eventually(t, func() bool {
+		_, ok := resolver.Lookup(warpID)
+		return ok
+	}, 2*time.Second, 20*time.Millisecond)
+
+	// Thin node connects to the relay over the plain TCP+camouflage
+	// leg — same way warpdroid reaches a bootstrap.
+	connect(t, thinH, relayH)
+
+	// Sanity: thin node really has no public listen addresses.
+	require.Empty(t, thinH.Addrs(), "thin node must not advertise any addrs")
+
+	// Now dial the listener purely by alias multiaddr.
+	target, err := ma.NewMultiaddr(
+		"/p2p/" + relayH.ID().String() +
+			"/warpid/" + warpID +
+			"/p2p/" + listenerH.ID().String(),
+	)
+	require.NoError(t, err)
+	thinH.Peerstore().AddAddr(listenerH.ID(), target, peerstore.TempAddrTTL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	s, err := thinH.NewStream(ctx, listenerH.ID(), echoProtoAlias)
+	require.NoError(t, err)
+	defer s.Close()
+
+	payload := []byte("from-thin-node")
+	_, err = s.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, s.CloseWrite())
+
+	got, err := io.ReadAll(s)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+// TestThinNodeCannotListenAlias asserts that a dial-only thin host
+// rejects attempts to Listen on a /warpid/ multiaddr — the listen path
+// needs a non-empty WarpID, which EnableAlias("") deliberately does
+// not provide.
+func TestThinNodeCannotListenAlias(t *testing.T) {
+	relayH, _ := makeRelay(t)
+	thinH := makeThinHost(t)
+
+	connect(t, thinH, relayH)
+
+	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + freshWarpID(t))
+	require.NoError(t, err)
+	err = thinH.Network().Listen(listenAddr)
+	require.Error(t, err, "thin node must not be able to register an alias")
 }
 
 // makeHost spins up a libp2p host configured with CamouflageTransport
