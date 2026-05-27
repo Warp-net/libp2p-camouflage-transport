@@ -273,11 +273,12 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 	return a.transport.wrapStreamStack(s, local, raddr, true /* client */)
 }
 
-// listen registers this peer's WarpID on the relay encoded in laddr and
-// returns a listener whose advertised address is only the alias. Many
-// listeners can be active concurrently (one per relay) — that is what
-// auto-discovery uses to publish redundant alias paths.
-func (a *aliasMode) listen(t transport.Transport, laddr ma.Multiaddr) (transport.Listener, error) {
+// prepareListener registers this peer's WarpID on the relay encoded in
+// laddr and returns a manet.Listener whose Accept yields streamConn's
+// fed by the stop-stream handler. The camouflage wrap and
+// upgrader.UpgradeGatedMaListener call live in CamouflageTransport.Listen
+// — the alias layer only supplies the conn source.
+func (a *aliasMode) prepareListener(laddr ma.Multiaddr) (manet.Listener, error) {
 	if a.warpID == "" {
 		return nil, errors.New("camouflage/alias: cannot listen — no WarpID configured")
 	}
@@ -308,12 +309,7 @@ func (a *aliasMode) listen(t transport.Transport, laddr ma.Multiaddr) (transport
 		a.clear(sl)
 		return nil, err
 	}
-
-	// Run the proxied accepts through the same SpoofConn + TLS pipeline
-	// the TCP listener uses — no duplicated wrapping code in alias.
-	gated := a.upgrader.GateMaListener(sl)
-	camo := a.transport.newCamouflageAccept(gated)
-	return a.upgrader.UpgradeGatedMaListener(t, camo), nil
+	return sl, nil
 }
 
 // registerOnRelay signs the WarpID with the host's private key and sends

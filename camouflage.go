@@ -314,37 +314,25 @@ func (t *CamouflageTransport) dialRaw(ctx context.Context, raddr ma.Multiaddr) (
 	return d.DialContext(ctx, raddr)
 }
 
-// Listen creates a TCP listener whose accepted connections are wrapped
-// with SpoofConn + real TLS camouflage so that the TLS handshake
-// completes before the Noise upgrade. When the multiaddr ends in
-// /warpid/<id>, the listener registers the alias on the relay encoded in
-// the address prefix and advertises only that alias.
+// Listen creates a listener whose accepted connections are wrapped with
+// SpoofConn + real TLS camouflage so that the TLS handshake completes
+// before the Noise upgrade. The underlying connection source depends on
+// the multiaddr:
 //
-// When sharedTCP is available, we register as DemultiplexedConnType_TLS
-// so that the tcpreuse demultiplexer routes incoming TLS ClientHello
-// connections (first byte 0x16) to this transport. Without this, the
-// shared port cannot dispatch connections to us.
+//   - /warpid/<id>          – an in-memory listener fed by the alias
+//     stop-stream handler; the alias is registered on the relay encoded
+//     in the address prefix and advertised in place of an IP.
+//   - sharedTCP available    – DemultiplexedListen on the reuseport
+//     TCP, routing first-byte 0x16 (TLS ClientHello) to this transport.
+//   - otherwise              – a plain manet.Listen.
+//
+// Whatever the source, the same camouflageGatedMaListener wrap and the
+// same upgrader.UpgradeGatedMaListener call apply. There is exactly one
+// listener-upgrade code path in this transport.
 func (t *CamouflageTransport) Listen(laddr ma.Multiaddr) (transport.Listener, error) {
-	if hasWarpID(laddr) {
-		a := t.currentAlias()
-		if a == nil {
-			return nil, errors.New("camouflage/alias: /warpid/ listen requested but alias mode is not enabled (call EnableAlias)")
-		}
-		return a.listen(t, laddr)
-	}
-	var gated transport.GatedMaListener
-	if t.sharedTCP != nil {
-		var err error
-		gated, err = t.sharedTCP.DemultiplexedListen(laddr, tcpreuse.DemultiplexedConnType_TLS)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		mal, err := manet.Listen(laddr)
-		if err != nil {
-			return nil, err
-		}
-		gated = t.upgrader.GateMaListener(mal)
+	gated, err := t.gateListenerFor(laddr)
+	if err != nil {
+		return nil, err
 	}
 
 	camouflageList := &camouflageGatedMaListener{
@@ -364,6 +352,36 @@ func (t *CamouflageTransport) currentAlias() *aliasMode {
 	t.aliasMu.Lock()
 	defer t.aliasMu.Unlock()
 	return t.alias
+}
+
+// gateListenerFor produces a GatedMaListener whose Accept feeds the
+// camouflage+upgrade pipeline in Listen. Three sources:
+//
+//   - /warpid/  → in-memory streamListener from aliasMode (registration
+//     on the relay is done here, before the listener becomes accept-able)
+//   - sharedTCP → DemultiplexedListen on the reuseport TCP, scoped to
+//     TLS ClientHello (first byte 0x16)
+//   - default   → manet.Listen, then GateMaListener
+func (t *CamouflageTransport) gateListenerFor(laddr ma.Multiaddr) (transport.GatedMaListener, error) {
+	if hasWarpID(laddr) {
+		a := t.currentAlias()
+		if a == nil {
+			return nil, errors.New("camouflage/alias: /warpid/ listen requested but alias mode is not enabled (call EnableAlias)")
+		}
+		sl, err := a.prepareListener(laddr)
+		if err != nil {
+			return nil, err
+		}
+		return t.upgrader.GateMaListener(sl), nil
+	}
+	if t.sharedTCP != nil {
+		return t.sharedTCP.DemultiplexedListen(laddr, tcpreuse.DemultiplexedConnType_TLS)
+	}
+	mal, err := manet.Listen(laddr)
+	if err != nil {
+		return nil, err
+	}
+	return t.upgrader.GateMaListener(mal), nil
 }
 
 // CanDial returns true if the transport can dial the given multiaddr.
@@ -502,21 +520,6 @@ func (t *CamouflageTransport) wrapStack(c manet.Conn, isClient bool) (manet.Conn
 // same SpoofConn + TLS pipeline.
 func (t *CamouflageTransport) wrapStreamStack(s network.Stream, local, remote ma.Multiaddr, isClient bool) (manet.Conn, error) {
 	return t.wrapStack(&streamConn{stream: s, local: local, remote: remote}, isClient)
-}
-
-// newCamouflageAccept wraps a GatedMaListener with the same
-// SpoofConn + TLS camouflage that the TCP Listen path uses. The alias
-// listener feeds it from an in-memory manet.Listener so accepted
-// proxied-via-relay streams get the same camouflage treatment as
-// directly-accepted TCP connections.
-func (t *CamouflageTransport) newCamouflageAccept(gated transport.GatedMaListener) transport.GatedMaListener {
-	return &camouflageGatedMaListener{
-		GatedMaListener: gated,
-		fragmentSize:    t.fragmentSize,
-		handshakeLen:    t.handshakeLen,
-		maxDelay:        t.maxDelay,
-		camoConfig:      t.camoConfig,
-	}
 }
 
 // streamConn adapts a libp2p network.Stream into a manet.Conn so the
