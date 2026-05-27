@@ -31,12 +31,8 @@ import (
 	"context"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/Warp-net/libp2p-camouflage-transport/aliasresolver"
-
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -162,9 +158,8 @@ func WithWarpID(warpID string) Option {
 
 // CamouflageTransport is a libp2p transport that wraps TCP connections with
 // real TLS camouflage (uTLS browser fingerprint) and handshake-phase
-// traffic fragmentation to evade DPI. With WithWarpID it additionally
-// listens on and dials /warpid/<hex> alias multiaddrs, hiding the local
-// IP behind a relay-resolved alias.
+// traffic fragmentation to evade DPI. When constructed with a host (DI)
+// it also owns an *aliasMode that handles /warpid/ multiaddrs on top.
 type CamouflageTransport struct {
 	inner     *tcp.TcpTransport
 	upgrader  transport.Upgrader
@@ -182,14 +177,15 @@ type CamouflageTransport struct {
 	handshakeTimeout   time.Duration
 	camoConfig         *CamouflageConfig // built once in constructor
 
-	// Alias mode (optional). host and privKey are pulled from the libp2p
-	// DI graph in the constructor; warpID is set via WithWarpID.
-	host    host.Host
-	privKey crypto.PrivKey
-	warpID  string
+	// warpID is a transient holder for the value supplied by
+	// WithWarpID; it is consumed when alias is constructed and never
+	// read again from here.
+	warpID string
 
-	aliasMu       sync.Mutex
-	aliasListener *aliasedListener // at most one Listen per transport
+	// alias is non-nil whenever the DI graph supplied a host. It owns
+	// every piece of alias state; this transport never reaches into it
+	// directly.
+	alias *aliasMode
 }
 
 var _ transport.Transport = (*CamouflageTransport)(nil)
@@ -214,7 +210,6 @@ func NewCamouflageTransport(
 		upgrader:           upgrader,
 		rcmgr:              rcmgr,
 		sharedTCP:          sharedTCP,
-		host:               h,
 		fragmentSize:       DefaultFragmentSize,
 		handshakeLen:       DefaultHandshakeLen,
 		maxDelay:           DefaultMaxDelay,
@@ -245,24 +240,24 @@ func NewCamouflageTransport(
 	}
 	t.camoConfig = cfg
 
-	// Alias mode is wired up once the host is available. We install the
-	// stop-protocol handler unconditionally so even dial-only nodes can
-	// later become listeners by issuing a Listen on a /warpid/ addr.
-	if t.host != nil {
-		t.privKey = t.host.Peerstore().PrivKey(t.host.ID())
-		t.host.SetStreamHandler(aliasresolver.StopProtocol, t.handleStopStream)
+	// Hand the alias-relevant inputs off to the alias layer and forget
+	// about them. From now on this transport only delegates to t.alias
+	// when it sees a /warpid/ multiaddr.
+	if h != nil {
+		t.alias = newAliasMode(h, upgrader, t.warpID)
 	}
+	t.warpID = ""
 
 	return t, nil
 }
 
 // Dial dials the remote peer, wrapping the raw TCP connection with
 // SpoofConn + real TLS camouflage before the Noise handshake. When the
-// multiaddr contains a /warpid/ component, the dial is routed through a
-// relay using the alias resolver instead.
+// multiaddr contains a /warpid/ component, the dial is delegated to the
+// alias layer.
 func (t *CamouflageTransport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
-	if hasWarpID(raddr) {
-		return t.dialAlias(ctx, raddr, p)
+	if t.alias != nil && hasWarpID(raddr) {
+		return t.alias.dial(ctx, t, raddr, p)
 	}
 	connScope, err := t.rcmgr.OpenConnection(network.DirOutbound, true, raddr)
 	if err != nil {
@@ -343,8 +338,8 @@ func (t *CamouflageTransport) dialRaw(ctx context.Context, raddr ma.Multiaddr) (
 // connections (first byte 0x16) to this transport. Without this, the
 // shared port cannot dispatch connections to us.
 func (t *CamouflageTransport) Listen(laddr ma.Multiaddr) (transport.Listener, error) {
-	if hasWarpID(laddr) {
-		return t.listenAlias(laddr)
+	if t.alias != nil && hasWarpID(laddr) {
+		return t.alias.listen(t, laddr)
 	}
 	var gated transport.GatedMaListener
 	if t.sharedTCP != nil {
@@ -373,22 +368,25 @@ func (t *CamouflageTransport) Listen(laddr ma.Multiaddr) (transport.Listener, er
 }
 
 // CanDial returns true if the transport can dial the given multiaddr.
-// For alias addresses the check is structural — we only return true
-// when the address actually decomposes into /<prefix-with-relay-p2p>
-// /warpid/<valid-id>[/p2p/<target>], so a malformed alias never selects
-// us out from under the swarm.
+// Alias addresses are delegated to the alias layer for structural
+// validation (it only accepts well-formed /p2p/<relay>/warpid/<id>
+// addresses).
 func (t *CamouflageTransport) CanDial(addr ma.Multiaddr) bool {
 	if hasWarpID(addr) {
-		_, _, err := splitAliasDialAddr(addr)
-		return err == nil
+		return t.alias != nil && t.alias.canDial(addr)
 	}
 	return t.inner.CanDial(addr)
 }
 
 // Protocols returns the set of protocols handled by this transport: the
-// inner TCP transport's protocols plus /warpid/ for alias mode.
+// inner TCP transport's protocols, plus /warpid/ whenever the alias
+// layer is wired up.
 func (t *CamouflageTransport) Protocols() []int {
-	return append(t.inner.Protocols(), P_WARPID)
+	p := t.inner.Protocols()
+	if t.alias != nil {
+		p = append(p, P_WARPID)
+	}
+	return p
 }
 
 // Proxy returns true so the swarm prefers this transport for multiaddrs
