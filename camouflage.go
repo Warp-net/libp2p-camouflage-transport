@@ -497,61 +497,13 @@ func (t *CamouflageTransport) wrapConn(c manet.Conn) *SpoofConn {
 	return NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
 }
 
-// wrapStack applies the full DPI-evasion stack (SpoofConn fragmentation
-// + TLS camouflage) to a manet.Conn. The TCP-dial path inlines these
-// two steps; the alias-dial path uses this helper so the stream
-// proxied through a relay carries the same defenses as a direct
-// camouflage TCP connection. isClient selects between client-side
-// (uTLS browser fingerprint) and server-side (plausible cert chain)
-// camouflage configuration.
-func (t *CamouflageTransport) wrapStack(c manet.Conn, isClient bool) (manet.Conn, error) {
-	spoofed := NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
-	camouflaged, err := NewCamouflageConn(spoofed, isClient, t.camoConfig)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	return camouflaged, nil
+// spoofStream is the alias-side counterpart to wrapConn: it produces a
+// SpoofConn directly from a libp2p network.Stream with the supplied
+// multiaddr metadata. No intermediate adapter type — SpoofConn already
+// handles both source kinds.
+func (t *CamouflageTransport) spoofStream(s network.Stream, local, remote ma.Multiaddr) *SpoofConn {
+	return NewSpoofConnFromStream(s, local, remote, t.fragmentSize, t.handshakeLen, t.maxDelay)
 }
-
-// wrapStreamStack is the same as wrapStack but takes a libp2p
-// network.Stream and the multiaddr metadata to attach to it. The alias
-// path uses streams (not raw TCP), so it needs this adapter to feed the
-// same SpoofConn + TLS pipeline.
-func (t *CamouflageTransport) wrapStreamStack(s network.Stream, local, remote ma.Multiaddr, isClient bool) (manet.Conn, error) {
-	return t.wrapStack(&streamConn{stream: s, local: local, remote: remote}, isClient)
-}
-
-// streamConn adapts a libp2p network.Stream into a manet.Conn so the
-// SpoofConn / camouflageGatedMaListener pipeline can wrap it without
-// caring whether the bytes ride on raw TCP or on a relay-proxied
-// libp2p stream.
-type streamConn struct {
-	stream network.Stream
-	local  ma.Multiaddr
-	remote ma.Multiaddr
-}
-
-var _ manet.Conn = (*streamConn)(nil)
-
-func (c *streamConn) Read(p []byte) (int, error)  { return c.stream.Read(p) }
-func (c *streamConn) Write(p []byte) (int, error) { return c.stream.Write(p) }
-func (c *streamConn) Close() error                { return c.stream.Close() }
-
-func (c *streamConn) LocalAddr() net.Addr  { return streamNetAddr{label: c.local.String()} }
-func (c *streamConn) RemoteAddr() net.Addr { return streamNetAddr{label: c.remote.String()} }
-
-func (c *streamConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
-func (c *streamConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
-func (c *streamConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }
-
-func (c *streamConn) LocalMultiaddr() ma.Multiaddr  { return c.local }
-func (c *streamConn) RemoteMultiaddr() ma.Multiaddr { return c.remote }
-
-type streamNetAddr struct{ label string }
-
-func (a streamNetAddr) Network() string { return "libp2p-warpid" }
-func (a streamNetAddr) String() string  { return a.label }
 
 type camouflageGatedMaListener struct {
 	transport.GatedMaListener

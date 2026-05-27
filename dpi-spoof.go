@@ -29,21 +29,44 @@ package camouflage
 
 import (
 	"crypto/rand"
-	manet "github.com/multiformats/go-multiaddr/net"
 	"io"
 	"math/big"
+	"net"
 	"sync"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/network"
+	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 const defaultFragmentSize = 2
 
-// SpoofConn wraps a manet.Conn and transparently splits Write calls into
-// small TCP segments while the connection is in the handshake phase (the
-// first handshakeLen bytes). After the handshake, writes pass through
+// spoofSource is the minimal contract SpoofConn requires from its
+// underlying source: byte transport plus deadline handling. Both
+// manet.Conn (raw TCP path) and network.Stream (relay-proxied alias
+// path) satisfy it, so SpoofConn can wrap either uniformly.
+type spoofSource interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	SetDeadline(time.Time) error
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// SpoofConn wraps a stream-like source and transparently splits Write
+// calls into small segments during the handshake phase (the first
+// handshakeLen bytes). After the handshake, writes pass through
 // without modification.
+//
+// It implements manet.Conn directly, so it flows through the camouflage
+// listener + upgrader pipeline regardless of whether the bytes ride on
+// raw TCP or on a relay-proxied libp2p stream.
 type SpoofConn struct {
-	manet.Conn
+	src    spoofSource
+	local  ma.Multiaddr
+	remote ma.Multiaddr
 
 	mu           sync.Mutex
 	bytesWritten int
@@ -52,26 +75,85 @@ type SpoofConn struct {
 	maxDelay     time.Duration
 }
 
+var _ manet.Conn = (*SpoofConn)(nil)
+
+// NewSpoofConn wraps a manet.Conn. If the argument is already a
+// *SpoofConn (because the alias path pre-wrapped a network.Stream),
+// the same SpoofConn is returned unchanged — that way the camouflage
+// listener pipeline can call NewSpoofConn on every accepted conn
+// uniformly without double-fragmenting.
 func NewSpoofConn(conn manet.Conn, fragmentSize, handshakeLen int, maxDelay time.Duration) *SpoofConn {
+	if sc, ok := conn.(*SpoofConn); ok {
+		return sc
+	}
 	return &SpoofConn{
-		Conn:         conn,
-		mu:           sync.Mutex{},
-		bytesWritten: 0,
+		src:          conn,
+		local:        conn.LocalMultiaddr(),
+		remote:       conn.RemoteMultiaddr(),
 		fragmentSize: fragmentSize,
 		handshakeLen: handshakeLen,
 		maxDelay:     maxDelay,
 	}
 }
 
+// NewSpoofConnFromStream wraps a libp2p network.Stream as a SpoofConn.
+// Used by the alias path; local and remote are the multiaddrs that
+// should be exposed via manet.Conn methods.
+func NewSpoofConnFromStream(s network.Stream, local, remote ma.Multiaddr, fragmentSize, handshakeLen int, maxDelay time.Duration) *SpoofConn {
+	return &SpoofConn{
+		src:          s,
+		local:        local,
+		remote:       remote,
+		fragmentSize: fragmentSize,
+		handshakeLen: handshakeLen,
+		maxDelay:     maxDelay,
+	}
+}
+
+func (c *SpoofConn) Read(p []byte) (int, error)         { return c.src.Read(p) }
+func (c *SpoofConn) Close() error                       { return c.src.Close() }
+func (c *SpoofConn) SetDeadline(t time.Time) error      { return c.src.SetDeadline(t) }
+func (c *SpoofConn) SetReadDeadline(t time.Time) error  { return c.src.SetReadDeadline(t) }
+func (c *SpoofConn) SetWriteDeadline(t time.Time) error { return c.src.SetWriteDeadline(t) }
+
+func (c *SpoofConn) LocalAddr() net.Addr {
+	if a, ok := c.src.(interface{ LocalAddr() net.Addr }); ok {
+		return a.LocalAddr()
+	}
+	return spoofAddr(maStr(c.local))
+}
+
+func (c *SpoofConn) RemoteAddr() net.Addr {
+	if a, ok := c.src.(interface{ RemoteAddr() net.Addr }); ok {
+		return a.RemoteAddr()
+	}
+	return spoofAddr(maStr(c.remote))
+}
+
+func (c *SpoofConn) LocalMultiaddr() ma.Multiaddr  { return c.local }
+func (c *SpoofConn) RemoteMultiaddr() ma.Multiaddr { return c.remote }
+
+type spoofAddr string
+
+func (a spoofAddr) Network() string { return "camouflage" }
+func (a spoofAddr) String() string  { return string(a) }
+
+func maStr(a ma.Multiaddr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
 // Write fragments b into small segments if the handshake phase is still
-// active; otherwise it delegates directly to the underlying connection.
+// active; otherwise it delegates directly to the underlying source.
 func (c *SpoofConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	pastHandshake := c.bytesWritten >= c.handshakeLen
 	c.mu.Unlock()
 
 	if pastHandshake {
-		return c.Conn.Write(b)
+		return c.src.Write(b)
 	}
 
 	return c.fragmentedWrite(b)
@@ -92,7 +174,7 @@ func (c *SpoofConn) fragmentedWrite(b []byte) (int, error) {
 		if pastHandshake {
 			// Past handshake: write-all loop for the remainder.
 			for len(b) > 0 {
-				n, err := c.Conn.Write(b)
+				n, err := c.src.Write(b)
 				c.mu.Lock()
 				c.bytesWritten += n
 				c.mu.Unlock()
@@ -109,7 +191,7 @@ func (c *SpoofConn) fragmentedWrite(b []byte) (int, error) {
 		}
 
 		size := min(fragSize, len(b))
-		n, err := c.Conn.Write(b[:size])
+		n, err := c.src.Write(b[:size])
 		c.mu.Lock()
 		c.bytesWritten += n
 		c.mu.Unlock()
@@ -135,17 +217,17 @@ func (c *SpoofConn) fragmentedWrite(b []byte) (int, error) {
 	return total, nil
 }
 
-// CloseRead forwards to the underlying connection if supported.
+// CloseRead forwards to the underlying source if supported.
 func (c *SpoofConn) CloseRead() error {
-	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+	if cr, ok := c.src.(interface{ CloseRead() error }); ok {
 		return cr.CloseRead()
 	}
 	return nil
 }
 
-// CloseWrite forwards to the underlying connection if supported.
+// CloseWrite forwards to the underlying source if supported.
 func (c *SpoofConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+	if cw, ok := c.src.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
 	return nil

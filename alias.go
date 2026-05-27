@@ -269,12 +269,20 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 	local := buildAliasMultiaddr(relayID, localID)
 	// Apply SpoofConn + TLS camouflage on the proxied stream so the
 	// dialer↔listener leg through the relay carries the same DPI-
-	// evasion stack as a direct TCP+camouflage connection.
-	return a.transport.wrapStreamStack(s, local, raddr, true /* client */)
+	// evasion stack as a direct TCP+camouflage connection. SpoofConn
+	// is constructed directly from the libp2p stream — no separate
+	// adapter type needed.
+	spoofed := a.transport.spoofStream(s, local, raddr)
+	camouflaged, err := NewCamouflageConn(spoofed, true /* client */, a.transport.camoConfig)
+	if err != nil {
+		_ = s.Reset()
+		return nil, fmt.Errorf("camouflage/alias: TLS camouflage: %w", err)
+	}
+	return camouflaged, nil
 }
 
 // prepareListener registers this peer's WarpID on the relay encoded in
-// laddr and returns a manet.Listener whose Accept yields streamConn's
+// laddr and returns a manet.Listener whose Accept yields SpoofConn's
 // fed by the stop-stream handler. The camouflage wrap and
 // upgrader.UpgradeGatedMaListener call live in CamouflageTransport.Listen
 // — the alias layer only supplies the conn source.
@@ -372,12 +380,12 @@ func (a *aliasMode) handleStop(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
-	// Adapt the libp2p stream into a manet.Conn and hand it to the
-	// streamListener. The accept pipeline (camouflageGatedMaListener
-	// behind upgrader.UpgradeGatedMaListener) will wrap it with
-	// SpoofConn + TLS camouflage and then run Noise on top.
-	conn := &streamConn{stream: s, local: l.addr, remote: l.addr}
-	if !l.deliver(conn) {
+	// Wrap the stream as a SpoofConn (which IS a manet.Conn) and hand
+	// it to the streamListener. The accept pipeline
+	// (camouflageGatedMaListener behind upgrader.UpgradeGatedMaListener)
+	// calls NewSpoofConn again, but that's idempotent for *SpoofConn;
+	// the TLS camouflage wrap is then applied exactly once.
+	if !l.deliver(a.transport.spoofStream(s, l.addr, l.addr)) {
 		_ = s.Reset()
 	}
 }
@@ -619,9 +627,9 @@ func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 }
 
 // ===========================================================================
-// streamListener — minimal manet.Listener whose Accept() pulls already-
-// adapted streamConn's from an in-memory queue. The alias path feeds it
-// from the stop-stream handler, then runs the standard
+// streamListener — minimal manet.Listener whose Accept() pulls
+// SpoofConn-wrapped streams from an in-memory queue. The alias path
+// feeds it from the stop-stream handler, then runs the standard
 // upgrader.GateMaListener → camouflageGatedMaListener →
 // UpgradeGatedMaListener pipeline on top — same SpoofConn + TLS
 // camouflage the direct TCP listener uses, no duplicated logic here.
@@ -695,4 +703,4 @@ func (l *streamListener) Close() error {
 }
 
 func (l *streamListener) Multiaddr() ma.Multiaddr { return l.addr }
-func (l *streamListener) Addr() net.Addr          { return streamNetAddr{label: l.addr.String()} }
+func (l *streamListener) Addr() net.Addr          { return spoofAddr(l.addr.String()) }
