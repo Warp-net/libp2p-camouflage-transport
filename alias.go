@@ -166,6 +166,9 @@ func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Mu
 		return nil, fmt.Errorf("camouflage/alias: dial multiaddr target %s != peer arg %s", target, p)
 	}
 
+	// usefd=false: alias rides on an existing libp2p stream on an
+	// existing TCP conn to the relay — no new FD. Passing true would
+	// phantom-charge the ResourceManager's system.fd budget.
 	scope, err := a.host.Network().ResourceManager().OpenConnection(network.DirOutbound, false, raddr)
 	if err != nil {
 		return nil, err
