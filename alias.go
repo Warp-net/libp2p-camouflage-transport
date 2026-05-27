@@ -601,6 +601,16 @@ func (l *streamListener) deliver(c manet.Conn) bool {
 func (l *streamListener) Accept() (manet.Conn, error) {
 	select {
 	case c := <-l.incoming:
+		// Close may have flipped isClosed between deliver enqueuing
+		// and us reading. Without this post-read check Go's select
+		// could hand a caller a conn after the listener was closed.
+		l.closeMu.Lock()
+		closed := l.isClosed
+		l.closeMu.Unlock()
+		if closed {
+			_ = c.Close()
+			return nil, net.ErrClosed
+		}
 		return c, nil
 	case <-l.closed:
 		return nil, net.ErrClosed
