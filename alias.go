@@ -25,12 +25,6 @@ resulting from the use or misuse of this software.
 // Copyright 2025 Vadim Filin
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// alias.go: IP-hiding layer on top of CamouflageTransport. aliasMode owns
-// every piece of alias state (host, key, mutex, listener); the transport
-// only delegates Dial/Listen/CanDial for /warpid/ multiaddrs to it. The
-// alias layer in turn never reaches into the transport's fields — they
-// communicate via method arguments only.
-
 package camouflage
 
 import (
@@ -56,27 +50,16 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 )
 
-// P_WARPID is the multiaddr protocol code for the /warpid/<hex> component.
-// 0x0300 sits in the private-use range and does not collide with any
-// upstream multicodec entry as of go-multiaddr v0.16.
+// P_WARPID is the multiaddr protocol code for /warpid/<hex>.
 const P_WARPID = 0x0300
 
-// WarpIDName is the textual protocol name (`/warpid/...`).
 const WarpIDName = "warpid"
-
-// WarpIDByteLen is the fixed length of a decoded WarpID. The textual form
-// is hex-encoded, so the string is always WarpIDByteLen*2 characters.
 const WarpIDByteLen = 32
 
-// AliasDialTimeout caps how long a single resolve handshake (open stream
-// to relay, send id, read status) may take before being aborted.
 var AliasDialTimeout = 30 * time.Second
 
 var errInvalidWarpID = errors.New("warpid: invalid value")
 
-// init registers the /warpid/ multiaddr protocol. If the code/name is
-// already taken by something else we panic so the misconfiguration is
-// caught at startup rather than producing mis-parsed multiaddrs later.
 func init() {
 	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code != 0 && existing.Name != WarpIDName {
 		panic(fmt.Sprintf("camouflage/alias: P_WARPID (%#x) already registered as %q", P_WARPID, existing.Name))
@@ -85,7 +68,6 @@ func init() {
 		panic(fmt.Sprintf("camouflage/alias: protocol name %q already registered with code %#x", WarpIDName, existing.Code))
 	}
 	if existing := ma.ProtocolWithCode(P_WARPID); existing.Code == P_WARPID {
-		// Same package linked twice (e.g. via plugins). Nothing to do.
 		return
 	}
 	if err := ma.AddProtocol(ma.Protocol{
@@ -126,36 +108,20 @@ func warpIDValidate(b []byte) error {
 	return nil
 }
 
-// hasWarpID reports whether the multiaddr contains a /warpid/ component.
 func hasWarpID(a ma.Multiaddr) bool {
 	_, err := a.ValueForProtocol(P_WARPID)
 	return err == nil
 }
 
-// ===========================================================================
-// aliasMode: the IP-hiding layer. Owns its own host reference, key, and
-// listener state. The host transport interacts with it through the four
-// exported methods below (dial, listen, canDial, plus the constructor).
-// ===========================================================================
-
-// spoofStreamFn produces a SpoofConn over a libp2p stream with the
-// camouflage transport's fragmentation parameters. Passed into aliasMode
-// at construction so alias code never reads camouflage state directly.
 type spoofStreamFn func(s network.Stream, local, remote ma.Multiaddr) *SpoofConn
-
-// wrapStreamFn does the full SpoofConn + TLS-camouflage wrap (the
-// pipeline the direct TCP-dial path applies inline). Used by the alias
-// dial path; isClient toggles between client and server TLS roles.
 type wrapStreamFn func(s network.Stream, local, remote ma.Multiaddr, isClient bool) (manet.Conn, error)
 
 type aliasMode struct {
 	host     host.Host
-	privKey  crypto.PrivKey // may be nil; dial-only nodes don't need it
-	warpID   string         // empty => dial-only (cannot listen)
+	privKey  crypto.PrivKey // nil for dial-only nodes
+	warpID   string         // empty => dial-only
 	upgrader transport.Upgrader
 
-	// Wrapping factories captured at construction; aliasMode does not
-	// read or write CamouflageTransport state anywhere else.
 	spoofStream spoofStreamFn
 	wrapStream  wrapStreamFn
 
@@ -166,12 +132,6 @@ type aliasMode struct {
 	finderCancel context.CancelFunc
 }
 
-// newAliasMode wires the alias layer onto a host. It installs the stop
-// stream handler immediately so even a dial-only node can later flip
-// into listening on a /warpid/ multiaddr. When warpID is non-empty it
-// also starts a background relay-finder that auto-Listens via every
-// peer it discovers speaking aliasresolver.RegisterProtocol — same
-// shape as libp2p's autorelay for circuit-v2.
 func newAliasMode(h host.Host, upgrader transport.Upgrader, warpID string, spoof spoofStreamFn, wrap wrapStreamFn) *aliasMode {
 	a := &aliasMode{
 		host:        h,
@@ -192,24 +152,16 @@ func newAliasMode(h host.Host, upgrader transport.Upgrader, warpID string, spoof
 	return a
 }
 
-// canDial returns true only for well-formed alias dial multiaddrs.
 func (a *aliasMode) canDial(addr ma.Multiaddr) bool {
 	_, _, _, err := splitAliasDialAddr(addr)
 	return err == nil
 }
 
-// dial performs the relay-mediated resolve and returns an upgraded
-// libp2p connection to the target peer. The transport argument is used
-// only to satisfy the upgrader's transport.Transport parameter — the
-// alias layer never reads from it.
 func (a *aliasMode) dial(ctx context.Context, t transport.Transport, raddr ma.Multiaddr, p peer.ID) (transport.CapableConn, error) {
 	relayID, warpID, target, err := splitAliasDialAddr(raddr)
 	if err != nil {
 		return nil, err
 	}
-	// If the multiaddr embeds a /p2p/<target>, reject any mismatch with
-	// the caller's `p` early — letting it slip through would surface as
-	// an opaque upgrader/auth error several layers down.
 	if target != "" && target != p {
 		return nil, fmt.Errorf("camouflage/alias: dial multiaddr target %s != peer arg %s", target, p)
 	}
@@ -264,23 +216,16 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 		return nil, fmt.Errorf("camouflage/alias: relay refused resolve for %s", warpID)
 	}
 
-	// Clear the handshake deadline before handing the stream off to
-	// the upgrader, which will run its own Noise handshake.
 	_ = s.SetDeadline(time.Time{})
 
-	// Pick a non-empty label for the local multiaddr. Dial-only nodes
-	// (no WithWarpID) borrow the target's WarpID just so the resulting
-	// multiaddr is well-formed; identify still publishes the empty set
-	// because we never listen here.
+	// Dial-only nodes (no warpID) borrow the target's WarpID for the
+	// local label so the resulting multiaddr is well-formed.
 	localID := a.warpID
 	if localID == "" {
 		localID = warpID
 	}
 	local := buildAliasMultiaddr(relayID, localID)
-	// Apply SpoofConn + TLS camouflage on the proxied stream via the
-	// factory captured at construction — same wrap the TCP path uses,
-	// no direct knowledge of camouflage internals here.
-	camouflaged, err := a.wrapStream(s, local, raddr, true /* client */)
+	camouflaged, err := a.wrapStream(s, local, raddr, true)
 	if err != nil {
 		_ = s.Reset()
 		return nil, fmt.Errorf("camouflage/alias: TLS camouflage: %w", err)
@@ -288,11 +233,6 @@ func (a *aliasMode) openResolveStream(ctx context.Context, raddr ma.Multiaddr, r
 	return camouflaged, nil
 }
 
-// prepareListener registers this peer's WarpID on the relay encoded in
-// laddr and returns a manet.Listener whose Accept yields SpoofConn's
-// fed by the stop-stream handler. The camouflage wrap and
-// upgrader.UpgradeGatedMaListener call live in CamouflageTransport.Listen
-// — the alias layer only supplies the conn source.
 func (a *aliasMode) prepareListener(laddr ma.Multiaddr) (manet.Listener, error) {
 	if a.warpID == "" {
 		return nil, errors.New("camouflage/alias: cannot listen — no WarpID configured")
@@ -311,10 +251,9 @@ func (a *aliasMode) prepareListener(laddr ma.Multiaddr) (manet.Listener, error) 
 
 	listenAddr := buildAliasMultiaddr(relayID, warpID)
 
-	// Two-step construction so onClose can capture the listener instance
-	// that ends up in the map. Whatever path eventually closes the
-	// listener (libp2p shutdown, our Disconnected handler, the register
-	// failure path below) ends up clearing the map.
+	// onClose must capture the listener instance to verify it's still
+	// the active one — otherwise a stale Close could evict a successor
+	// from prepareListener-after-restart.
 	var sl *streamListener
 	sl = newStreamListener(relayID, listenAddr, func() {
 		a.mu.Lock()
@@ -333,16 +272,12 @@ func (a *aliasMode) prepareListener(laddr ma.Multiaddr) (manet.Listener, error) 
 	a.mu.Unlock()
 
 	if err := a.registerOnRelay(context.Background(), relayID); err != nil {
-		_ = sl.Close() // onClose evicts the map entry
+		_ = sl.Close()
 		return nil, err
 	}
 	return sl, nil
 }
 
-// registerOnRelay signs the WarpID with the host's private key and sends
-// it on RegisterProtocol. The relay verifies the signature against the
-// connection's RemotePublicKey, so the signed material need only bind
-// the alias to our identity.
 func (a *aliasMode) registerOnRelay(ctx context.Context, relayID peer.ID) error {
 	dialCtx, cancel := context.WithTimeout(ctx, AliasDialTimeout)
 	defer cancel()
@@ -357,8 +292,7 @@ func (a *aliasMode) registerOnRelay(ctx context.Context, relayID peer.ID) error 
 		_ = s.SetDeadline(deadline)
 	}
 
-	// Sign the raw 32-byte WarpID, not its hex rendering. The resolver
-	// verifies the same raw bytes after re-decoding the frame.
+	// Sign raw bytes so different hex encodings (case) never break verification.
 	idBytes, err := hex.DecodeString(a.warpID)
 	if err != nil {
 		_ = s.Reset()
@@ -384,10 +318,6 @@ func (a *aliasMode) registerOnRelay(ctx context.Context, relayID peer.ID) error 
 	return nil
 }
 
-// handleStop is invoked when a relay opens an inbound stream for a
-// dialer it has resolved to us. We route the stream to the listener
-// registered for that relay; streams from peers we never registered
-// with are dropped.
 func (a *aliasMode) handleStop(s network.Stream) {
 	relay := s.Conn().RemotePeer()
 
@@ -399,34 +329,15 @@ func (a *aliasMode) handleStop(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
-	// Local = our advertised alias. Remote = the relay's connection
-	// multiaddr, so RemoteMultiaddr != LocalMultiaddr and accepts
-	// arriving via different relays land in distinct ResourceManager
-	// scopes. Falling back to l.addr only if the underlying conn
-	// somehow lacks a remote multiaddr (shouldn't happen for a live
-	// stream, but we don't want a nil here either).
+	// Distinct remote per relay so ResourceManager scopes don't collapse.
 	remote := s.Conn().RemoteMultiaddr()
 	if remote == nil {
 		remote = l.addr
 	}
-	// Wrap the stream as a SpoofConn (which IS a manet.Conn) via the
-	// captured factory and hand it to the streamListener. The accept
-	// pipeline (camouflageGatedMaListener) calls NewSpoofConn again,
-	// but that's idempotent for *SpoofConn; the TLS camouflage wrap
-	// is then applied exactly once.
 	if !l.deliver(a.spoofStream(s, l.addr, remote)) {
 		_ = s.Reset()
 	}
 }
-
-
-// ===========================================================================
-// Auto relay-finder. Mirrors the libp2p autorelay shape for circuit-v2:
-// subscribe to identify completions, and for every peer that speaks
-// /warpnet/alias-register/0.0.0, automatically Listen on
-// /p2p/<peer>/warpid/<warpID>. The user doesn't have to call Listen
-// anywhere.
-// ===========================================================================
 
 func (a *aliasMode) runRelayFinder() {
 	sub, err := a.host.EventBus().Subscribe(new(event.EvtPeerIdentificationCompleted))
@@ -451,10 +362,8 @@ func (a *aliasMode) runRelayFinder() {
 			if !supportsRegisterProtocol(evt.Protocols) {
 				continue
 			}
-			// Only register through peers we have a real direct
-			// connection to. Limited connections are circuit-v2
-			// reservations with data/duration caps — opening a
-			// long-lived register stream over them just times out.
+			// Limited (circuit-v2) reservations have data/duration
+			// caps that would just time out a long-lived register stream.
 			if evt.Conn != nil && evt.Conn.Stat().Limited {
 				continue
 			}
@@ -475,20 +384,11 @@ func supportsRegisterProtocol(protos []protocol.ID) bool {
 	return false
 }
 
-// autoListen attempt budget. After this many failures we give up on
-// the peer; if it reconnects later, the new identify event will start
-// over from attempt 1.
 const (
 	autoListenMaxAttempts    = 5
 	autoListenInitialBackoff = 2 * time.Second
 )
 
-// maybeAutoListen calls swarm.Listen for /p2p/<relay>/warpid/<warpID>
-// if we are not yet registered with this relay. Idempotent: a second
-// call for the same relay is a fast no-op. On transient failure (relay
-// glitch, brief congestion) it schedules retries with exponential
-// backoff so a single hiccup does not lose us the relay slot until the
-// next identify event.
 func (a *aliasMode) maybeAutoListen(relay peer.ID) {
 	a.mu.Lock()
 	_, exists := a.listeners[relay]
@@ -513,7 +413,6 @@ func (a *aliasMode) retryAutoListen(relay peer.ID, addr ma.Multiaddr, attempt in
 		return
 	case <-time.After(backoff):
 	}
-	// Skip if the peer is gone, or someone else got the slot already.
 	if a.host.Network().Connectedness(relay) != network.Connected {
 		return
 	}
@@ -529,21 +428,12 @@ func (a *aliasMode) retryAutoListen(relay peer.ID, addr ma.Multiaddr, attempt in
 	}
 }
 
-// stop cancels the relay finder and unhooks the notifiee. Called from
-// CamouflageTransport's close path (if/when added) — currently the
-// goroutine also exits when the host's event bus closes, so explicit
-// stop is optional.
 func (a *aliasMode) stop() {
 	if a.finderCancel != nil {
 		a.finderCancel()
 	}
 	a.host.Network().StopNotify(a)
 }
-
-// ===========================================================================
-// network.Notifiee — drop the listener when its relay disconnects so the
-// listeners map stays in sync with reachable relays.
-// ===========================================================================
 
 var _ network.Notifiee = (*aliasMode)(nil)
 
@@ -554,25 +444,17 @@ func (a *aliasMode) Connected(_ network.Network, _ network.Conn)   {}
 func (a *aliasMode) Disconnected(n network.Network, c network.Conn) {
 	p := c.RemotePeer()
 	if len(n.ConnsToPeer(p)) > 0 {
-		return // still other conns alive
+		return
 	}
 	a.mu.Lock()
 	l := a.listeners[p]
 	a.mu.Unlock()
 	if l != nil {
-		_ = l.Close() // onClose evicts the map entry
+		_ = l.Close()
 	}
 }
 
-// ===========================================================================
-// multiaddr helpers
-// ===========================================================================
-
-// splitAliasDialAddr extracts the relay peer.ID, warpID, and optional
-// target peer.ID from a dial multiaddr of the form
-// .../p2p/<relay>/warpid/<id>[/p2p/<target>]. Anything past /warpid/
-// other than a single /p2p/<id> is rejected so CanDial cannot lure the
-// swarm into picking us for a malformed address.
+// splitAliasDialAddr parses .../p2p/<relay>/warpid/<id>[/p2p/<target>].
 func splitAliasDialAddr(a ma.Multiaddr) (peer.ID, string, peer.ID, error) {
 	warpComp, tail, err := splitOnWarpID(a)
 	if err != nil {
@@ -611,7 +493,7 @@ func splitAliasDialAddr(a ma.Multiaddr) (peer.ID, string, peer.ID, error) {
 	return relayID, warpComp.Value(), target, nil
 }
 
-// splitAliasListenAddr accepts /p2p/<relay>/warpid/<id> (no trailing /p2p/).
+// splitAliasListenAddr accepts /p2p/<relay>/warpid/<id> only.
 func splitAliasListenAddr(a ma.Multiaddr) (peer.ID, string, error) {
 	warpComp, tail, err := splitOnWarpID(a)
 	if err != nil {
@@ -637,8 +519,6 @@ func splitAliasListenAddr(a ma.Multiaddr) (peer.ID, string, error) {
 	return relayID, warpComp.Value(), nil
 }
 
-// splitOnWarpID returns (warpComponent, tailAfterWarp, error). tail is
-// nil when there is nothing after /warpid/<id>.
 func splitOnWarpID(a ma.Multiaddr) (*ma.Component, ma.Multiaddr, error) {
 	var warpComp *ma.Component
 	var tail ma.Multiaddr
@@ -665,11 +545,7 @@ func splitOnWarpID(a ma.Multiaddr) (*ma.Component, ma.Multiaddr, error) {
 	return warpComp, tail, nil
 }
 
-// buildAliasMultiaddr returns /p2p/<relayID>/warpid/<warpID>. Both
-// inputs are pre-validated by callers (relayID parsed from a multiaddr,
-// warpID checked for hex/length), so an error here means a programming
-// bug — surface it loudly instead of returning nil and causing a
-// nil-pointer panic far downstream.
+// buildAliasMultiaddr panics on bad input — callers pre-validate.
 func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 	relay, err := ma.NewComponent("p2p", relayID.String())
 	if err != nil {
@@ -682,19 +558,10 @@ func buildAliasMultiaddr(relayID peer.ID, warpID string) ma.Multiaddr {
 	return ma.Join(relay.Multiaddr(), wid.Multiaddr())
 }
 
-// ===========================================================================
-// streamListener — minimal manet.Listener whose Accept() pulls
-// SpoofConn-wrapped streams from an in-memory queue. The alias path
-// feeds it from the stop-stream handler, then runs the standard
-// upgrader.GateMaListener → camouflageGatedMaListener →
-// UpgradeGatedMaListener pipeline on top — same SpoofConn + TLS
-// camouflage the direct TCP listener uses, no duplicated logic here.
-// ===========================================================================
-
 type streamListener struct {
 	relayID peer.ID
 	addr    ma.Multiaddr
-	onClose func() // invoked exactly once on Close; nil = no-op
+	onClose func()
 
 	incoming chan manet.Conn
 
@@ -715,9 +582,8 @@ func newStreamListener(relayID peer.ID, addr ma.Multiaddr, onClose func()) *stre
 	}
 }
 
-// deliver enqueues an inbound conn for the next Accept. Holding closeMu
-// across the closed-check and the send rules out a select-randomisation
-// race where a stream could be enqueued after Close had drained.
+// deliver: closeMu guards the closed-check against the channel send so
+// a concurrent Close cannot accept a value after draining.
 func (l *streamListener) deliver(c manet.Conn) bool {
 	l.closeMu.Lock()
 	defer l.closeMu.Unlock()
@@ -751,11 +617,7 @@ func (l *streamListener) Close() error {
 	close(l.closed)
 	l.closeMu.Unlock()
 
-	// Cleanup runs OUTSIDE the close mutex so onClose can take other
-	// locks (aliasMode.mu) without ordering trouble. onClose is the
-	// hook that pulls this listener out of aliasMode.listeners — any
-	// Close path (libp2p shutdown, ListenClose, our own Disconnected
-	// handler) ends up here.
+	// onClose may take aliasMode.mu, so call it without closeMu held.
 	if l.onClose != nil {
 		l.onClose()
 	}
