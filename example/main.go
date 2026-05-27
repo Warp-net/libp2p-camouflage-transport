@@ -228,8 +228,10 @@ func runListener(args []string) {
 	must(h.Connect(ctx, *relayInfo))
 	cancel()
 
+	// The auto relay-finder running inside the transport will pick up
+	// /warpnet/alias-register/0.0.0 from identify and Listen on the
+	// alias multiaddr by itself — no explicit Listen call needed.
 	aliasAddr := mustMultiaddr("/p2p/" + relayInfo.ID.String() + "/warpid/" + *warpID)
-	must(h.Network().Listen(aliasAddr))
 
 	fmt.Printf("listener id   %s\n", h.ID())
 	fmt.Printf("listener addr %s\n", aliasAddr)

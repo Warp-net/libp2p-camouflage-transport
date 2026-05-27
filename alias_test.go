@@ -86,15 +86,14 @@ func TestThinNodeDialsAliasListener(t *testing.T) {
 		_, _ = io.Copy(s, s)
 	})
 
-	// Listener registers on the relay via alias listen.
+	// Listener connects to the relay; the alias auto-finder picks up
+	// /warpnet/alias-register/0.0.0 from identify and Listens on its
+	// own — no manual Listen call required.
 	connect(t, listenerH, relayH)
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	// Thin node connects to the relay over the plain TCP+camouflage
 	// leg — same way warpdroid reaches a bootstrap.
@@ -197,13 +196,10 @@ func TestResolverEvictsOnDisconnect(t *testing.T) {
 
 	connect(t, listenerH, relayH)
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond, "expected registration to land")
+	}, 5*time.Second, 20*time.Millisecond, "expected auto-listen registration to land")
 
 	// Close the listener-side host so the relay observes a disconnect.
 	require.NoError(t, listenerH.Close())
@@ -306,14 +302,10 @@ func TestAliasRoundtrip(t *testing.T) {
 		_, _ = io.Copy(s, s)
 	})
 
-	aliasAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(aliasAddr))
-
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	target, err := ma.NewMultiaddr(
 		"/p2p/" + relayH.ID().String() +
@@ -346,24 +338,22 @@ func TestRegisterConflictRejected(t *testing.T) {
 	first := makeHost(t, warpID)
 	second := makeHost(t, warpID)
 
+	// first registers via auto-finder.
 	connect(t, first, relayH)
-	connect(t, second, relayH)
-
-	aliasAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-
-	require.NoError(t, first.Network().Listen(aliasAddr))
 	require.Eventually(t, func() bool {
-		_, ok := resolver.Lookup(warpID)
-		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+		e, ok := resolver.Lookup(warpID)
+		return ok && e.Peer == first.ID()
+	}, 5*time.Second, 20*time.Millisecond)
 
-	err = second.Network().Listen(aliasAddr)
-	require.Error(t, err)
+	// second's auto-finder will also try to register and be rejected
+	// (different owning key); give it time to run and then verify the
+	// table is still owned by first.
+	connect(t, second, relayH)
+	time.Sleep(500 * time.Millisecond)
 
 	entry, ok := resolver.Lookup(warpID)
 	require.True(t, ok)
-	require.Equal(t, first.ID(), entry.Peer)
+	require.Equal(t, first.ID(), entry.Peer, "first owner must still hold the slot")
 }
 
 func TestAliasManyConcurrentDials(t *testing.T) {
@@ -381,13 +371,10 @@ func TestAliasManyConcurrentDials(t *testing.T) {
 		_, _ = io.Copy(s, s)
 	})
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	target, err := ma.NewMultiaddr(
 		"/p2p/" + relayH.ID().String() + "/warpid/" + warpID + "/p2p/" + listenerH.ID().String(),
@@ -451,13 +438,10 @@ func TestAliasLargePayload(t *testing.T) {
 		_, _ = io.Copy(s, s)
 	})
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	target, err := ma.NewMultiaddr(
 		"/p2p/" + relayH.ID().String() + "/warpid/" + warpID + "/p2p/" + listenerH.ID().String(),
@@ -498,13 +482,10 @@ func TestRegisterSameOwnerIdempotent(t *testing.T) {
 
 	connect(t, listenerH, relayH)
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	entry1, _ := resolver.Lookup(warpID)
 
@@ -541,10 +522,8 @@ func TestDialUnknownWarpIDFails(t *testing.T) {
 	connect(t, listenerH, relayH)
 	connect(t, dialerH, relayH)
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + known)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
-
+	// The listener will auto-Listen via the relay; we don't care if
+	// it has completed, the dial target is an UNREGISTERED WarpID.
 	target, err := ma.NewMultiaddr(
 		"/p2p/" + relayH.ID().String() + "/warpid/" + unknown + "/p2p/" + listenerH.ID().String(),
 	)
@@ -572,13 +551,10 @@ func TestDialAfterListenerCloseFails(t *testing.T) {
 		_, _ = io.Copy(s, s)
 	})
 
-	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
-	require.NoError(t, err)
-	require.NoError(t, listenerH.Network().Listen(listenAddr))
 	require.Eventually(t, func() bool {
 		_, ok := resolver.Lookup(warpID)
 		return ok
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
 	require.NoError(t, listenerH.Close())
 
