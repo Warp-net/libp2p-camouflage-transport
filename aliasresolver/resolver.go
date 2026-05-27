@@ -59,6 +59,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // Wire protocols spoken by the resolver. Versions are bumped if the
@@ -89,6 +90,11 @@ const (
 	handshakeTimeout = 10 * time.Second
 )
 
+// DefaultMaxEntries caps the WarpID table size. On a public relay this
+// keeps a botnet from filling memory with bogus registrations. One
+// owning peer may still occupy at most one slot at a time.
+const DefaultMaxEntries = 10000
+
 // Entry is a single row of the resolver table.
 type Entry struct {
 	Peer  peer.ID
@@ -97,36 +103,45 @@ type Entry struct {
 
 // Resolver keeps an in-memory WarpID -> peer mapping for a single relay
 // host. A WarpID is owned by the public key that first registered it; a
-// subsequent registration with a different key is rejected.
+// subsequent registration with a different key is rejected. Entries are
+// evicted automatically when the owning peer fully disconnects.
 type Resolver struct {
-	host host.Host
+	host       host.Host
+	maxEntries int
 
-	mu    sync.RWMutex
-	table map[string]Entry // key: hex WarpID
+	mu     sync.RWMutex
+	table  map[string]Entry // key: hex WarpID
+	byPeer map[peer.ID]string
 }
 
 // New returns an unstarted Resolver. Call Start to wire up stream
-// handlers on the host.
+// handlers and disconnect notifications on the host.
 func New(h host.Host) *Resolver {
 	return &Resolver{
-		host:  h,
-		table: make(map[string]Entry),
+		host:       h,
+		maxEntries: DefaultMaxEntries,
+		table:      make(map[string]Entry),
+		byPeer:     make(map[peer.ID]string),
 	}
 }
 
-// Start registers the resolver's stream handlers on the host. Safe to
-// call once per Resolver.
+// Start registers the resolver's stream handlers on the host and hooks
+// into network notifications so disconnected peers' WarpIDs are evicted
+// automatically. Safe to call once per Resolver.
 func (r *Resolver) Start() {
 	r.host.SetStreamHandler(RegisterProtocol, r.HandleRegister)
 	r.host.SetStreamHandler(ResolveProtocol, r.HandleResolve)
+	r.host.Network().Notify(r)
 }
 
 // Stop removes the resolver's stream handlers and clears the table.
 func (r *Resolver) Stop() {
 	r.host.RemoveStreamHandler(RegisterProtocol)
 	r.host.RemoveStreamHandler(ResolveProtocol)
+	r.host.Network().StopNotify(r)
 	r.mu.Lock()
 	r.table = make(map[string]Entry)
+	r.byPeer = make(map[peer.ID]string)
 	r.mu.Unlock()
 }
 
@@ -162,7 +177,12 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 		return
 	}
 
-	ok, err := pub.Verify([]byte(warpHex), sig)
+	// Verify the signature against the raw 32-byte WarpID, not its hex
+	// rendering. The wire frame carried the raw bytes; we just
+	// re-decoded what ReadRegisterFrame encoded, so the DecodeString
+	// call here is infallible.
+	idBytes, _ := hex.DecodeString(warpHex)
+	ok, err := pub.Verify(idBytes, sig)
 	if err != nil || !ok {
 		log.Printf("aliasresolver: register sig invalid from %s", s.Conn().RemotePeer())
 		_ = s.Reset()
@@ -178,7 +198,21 @@ func (r *Resolver) HandleRegister(s network.Stream) {
 		_ = WriteStatus(s, false)
 		return
 	}
+	// Reject net-new registrations once the table is full. Existing
+	// entries (same WarpID, same owner) still update in place.
+	if _, exists := r.table[warpHex]; !exists && len(r.table) >= r.maxEntries {
+		r.mu.Unlock()
+		log.Printf("aliasresolver: table full (%d), rejecting %s", r.maxEntries, remote)
+		_ = WriteStatus(s, false)
+		return
+	}
+	// One WarpID per owning peer: if this peer previously claimed a
+	// different alias, retire the old one.
+	if prev, ok := r.byPeer[remote]; ok && prev != warpHex {
+		delete(r.table, prev)
+	}
 	r.table[warpHex] = Entry{Peer: remote, Owner: pub}
+	r.byPeer[remote] = warpHex
 	r.mu.Unlock()
 
 	_ = WriteStatus(s, true)
@@ -332,6 +366,34 @@ func ReadStatus(r io.Reader) (bool, error) {
 		return false, err
 	}
 	return b[0] == statusOK, nil
+}
+
+// ===========================================================================
+// network.Notifiee — evict registrations when the owning peer fully
+// disconnects. This bounds memory on a public relay even when peers
+// churn without explicit unregister.
+// ===========================================================================
+
+var _ network.Notifiee = (*Resolver)(nil)
+
+func (r *Resolver) Listen(_ network.Network, _ ma.Multiaddr)      {}
+func (r *Resolver) ListenClose(_ network.Network, _ ma.Multiaddr) {}
+func (r *Resolver) Connected(_ network.Network, _ network.Conn)   {}
+
+func (r *Resolver) Disconnected(n network.Network, c network.Conn) {
+	p := c.RemotePeer()
+	// Only evict when the LAST connection to this peer goes away;
+	// otherwise a transient connection close (with another conn still
+	// up) would purge a still-reachable listener.
+	if len(n.ConnsToPeer(p)) > 0 {
+		return
+	}
+	r.mu.Lock()
+	if id, ok := r.byPeer[p]; ok {
+		delete(r.table, id)
+		delete(r.byPeer, p)
+	}
+	r.mu.Unlock()
 }
 
 func decodeWarpID(s string) ([]byte, error) {

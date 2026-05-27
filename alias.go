@@ -303,7 +303,14 @@ func (a *aliasMode) registerOnRelay(ctx context.Context, relayID peer.ID) error 
 		_ = s.SetDeadline(deadline)
 	}
 
-	sig, err := a.privKey.Sign([]byte(a.warpID))
+	// Sign the raw 32-byte WarpID, not its hex rendering. The resolver
+	// verifies the same raw bytes after re-decoding the frame.
+	idBytes, err := hex.DecodeString(a.warpID)
+	if err != nil {
+		_ = s.Reset()
+		return fmt.Errorf("camouflage/alias: warpID hex decode: %w", err)
+	}
+	sig, err := a.privKey.Sign(idBytes)
 	if err != nil {
 		_ = s.Reset()
 		return fmt.Errorf("camouflage/alias: sign warpID: %w", err)

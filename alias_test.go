@@ -85,6 +85,35 @@ func connect(t *testing.T, src, dst host.Host) {
 	require.NoError(t, src.Connect(ctx, peer.AddrInfo{ID: dst.ID(), Addrs: dst.Addrs()}))
 }
 
+// TestResolverEvictsOnDisconnect verifies that when a registered peer
+// fully disconnects from the relay, its WarpID is removed from the
+// resolver table. Without this the table would grow unbounded on a
+// public relay as peers churn.
+func TestResolverEvictsOnDisconnect(t *testing.T) {
+	warpID := freshWarpID(t)
+
+	relayH, resolver := makeRelay(t)
+	listenerH := makeHost(t, warpID)
+
+	connect(t, listenerH, relayH)
+
+	listenAddr, err := ma.NewMultiaddr("/p2p/" + relayH.ID().String() + "/warpid/" + warpID)
+	require.NoError(t, err)
+	require.NoError(t, listenerH.Network().Listen(listenAddr))
+	require.Eventually(t, func() bool {
+		_, ok := resolver.Lookup(warpID)
+		return ok
+	}, 2*time.Second, 20*time.Millisecond, "expected registration to land")
+
+	// Close the listener-side host so the relay observes a disconnect.
+	require.NoError(t, listenerH.Close())
+
+	require.Eventually(t, func() bool {
+		_, ok := resolver.Lookup(warpID)
+		return !ok
+	}, 5*time.Second, 50*time.Millisecond, "registration should be evicted after disconnect")
+}
+
 // TestPlainTCPDialUnaffectedByAliasMode verifies that hosts wired with
 // WithWarpID still dial each other directly over /ip4/.../tcp/... with
 // the normal DPI-camouflaged TCP path; the alias layer must not get in
@@ -383,7 +412,9 @@ func TestRegisterSameOwnerIdempotent(t *testing.T) {
 	defer cancel()
 	priv := listenerH.Peerstore().PrivKey(listenerH.ID())
 	require.NotNil(t, priv)
-	sig, err := priv.Sign([]byte(warpID))
+	idBytes, err := hex.DecodeString(warpID)
+	require.NoError(t, err)
+	sig, err := priv.Sign(idBytes)
 	require.NoError(t, err)
 
 	rs, err := listenerH.NewStream(ctx, relayH.ID(), aliasresolver.RegisterProtocol)
