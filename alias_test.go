@@ -634,3 +634,13 @@ func TestCanDialStructural(t *testing.T) {
 		TransportForDialing(ma.Multiaddr) transport.Transport
 	}).TransportForDialing(bad), "swarm must reject a /warpid/ with no relay prefix")
 }
+
+func TestEnableAliasServiceTwiceFails(t *testing.T) {
+	h := makeHost(t, "")
+	first, err := camouflage.EnableAliasService(h)
+	require.NoError(t, err)
+	defer first.Stop()
+
+	_, err = camouflage.EnableAliasService(h)
+	require.Error(t, err, "second EnableAliasService on same host must fail")
+}

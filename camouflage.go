@@ -381,6 +381,11 @@ func EnableAliasService(h host.Host) (*aliasresolver.Resolver, error) {
 	if h == nil {
 		return nil, errors.New("camouflage/alias: host is nil")
 	}
+	for _, p := range h.Mux().Protocols() {
+		if p == aliasresolver.RegisterProtocol {
+			return nil, errors.New("camouflage/alias: alias service already enabled")
+		}
+	}
 	r := aliasresolver.New(h)
 	r.Start()
 	return r, nil
