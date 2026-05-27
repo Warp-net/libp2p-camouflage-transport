@@ -95,6 +95,13 @@ const (
 // owning peer may still occupy at most one slot at a time.
 const DefaultMaxEntries = 10000
 
+// DefaultMaxBytesPerDirection caps how many bytes a single resolved
+// channel may pump in each direction through the relay. After the cap
+// is reached the side is CloseWrite-d and the dialer must establish a
+// new channel — analogous to circuit-v2 Limited reservations. Keeps a
+// public relay from being used as free bulk transport.
+const DefaultMaxBytesPerDirection int64 = 256 << 20 // 256 MiB
+
 // Entry is a single row of the resolver table.
 type Entry struct {
 	Peer  peer.ID
@@ -106,8 +113,9 @@ type Entry struct {
 // subsequent registration with a different key is rejected. Entries are
 // evicted automatically when the owning peer fully disconnects.
 type Resolver struct {
-	host       host.Host
-	maxEntries int
+	host                 host.Host
+	maxEntries           int
+	maxBytesPerDirection int64
 
 	mu     sync.RWMutex
 	table  map[string]Entry // key: hex WarpID
@@ -118,10 +126,11 @@ type Resolver struct {
 // handlers and disconnect notifications on the host.
 func New(h host.Host) *Resolver {
 	return &Resolver{
-		host:       h,
-		maxEntries: DefaultMaxEntries,
-		table:      make(map[string]Entry),
-		byPeer:     make(map[peer.ID]string),
+		host:                 h,
+		maxEntries:           DefaultMaxEntries,
+		maxBytesPerDirection: DefaultMaxBytesPerDirection,
+		table:                make(map[string]Entry),
+		byPeer:               make(map[peer.ID]string),
 	}
 }
 
@@ -261,21 +270,25 @@ func (r *Resolver) HandleResolve(s network.Stream) {
 	_ = s.SetDeadline(time.Time{})
 	_ = upstream.SetDeadline(time.Time{})
 
-	pipe(s, upstream)
+	pipe(s, upstream, r.maxBytesPerDirection)
 }
 
-// pipe shuffles bytes between the dialer (down) and the listener (up).
-func pipe(down, up network.Stream) {
+// pipe shuffles bytes between the dialer (down) and the listener (up),
+// capping each direction at maxBytes so a single resolve cannot exhaust
+// a public relay's outbound bandwidth. When the cap is hit, CloseWrite
+// signals EOF to the other side; the dialer can re-establish a fresh
+// alias channel if it needs to keep talking.
+func pipe(down, up network.Stream, maxBytes int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(up, down)
+		_, _ = io.CopyN(up, down, maxBytes)
 		_ = up.CloseWrite()
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(down, up)
+		_, _ = io.CopyN(down, up, maxBytes)
 		_ = down.CloseWrite()
 	}()
 	wg.Wait()

@@ -461,7 +461,17 @@ func (t *CamouflageTransport) enableAlias(h host.Host, warpID string) error {
 	if t.alias != nil {
 		return errors.New("camouflage/alias: already enabled")
 	}
-	t.alias = newAliasMode(t, h, t.upgrader, warpID)
+
+	// Capture camouflage settings into the factories aliasMode uses,
+	// so alias code never reads transport state directly.
+	spoof := func(s network.Stream, local, remote ma.Multiaddr) *SpoofConn {
+		return NewSpoofConnFromStream(s, local, remote, t.fragmentSize, t.handshakeLen, t.maxDelay)
+	}
+	wrap := func(s network.Stream, local, remote ma.Multiaddr, isClient bool) (manet.Conn, error) {
+		return NewCamouflageConn(spoof(s, local, remote), isClient, t.camoConfig)
+	}
+
+	t.alias = newAliasMode(h, t.upgrader, warpID, spoof, wrap)
 	return nil
 }
 
@@ -495,14 +505,6 @@ func (t *CamouflageTransport) String() string {
 
 func (t *CamouflageTransport) wrapConn(c manet.Conn) *SpoofConn {
 	return NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
-}
-
-// spoofStream is the alias-side counterpart to wrapConn: it produces a
-// SpoofConn directly from a libp2p network.Stream with the supplied
-// multiaddr metadata. No intermediate adapter type — SpoofConn already
-// handles both source kinds.
-func (t *CamouflageTransport) spoofStream(s network.Stream, local, remote ma.Multiaddr) *SpoofConn {
-	return NewSpoofConnFromStream(s, local, remote, t.fragmentSize, t.handshakeLen, t.maxDelay)
 }
 
 type camouflageGatedMaListener struct {
