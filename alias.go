@@ -120,7 +120,7 @@ type wrapStreamFn func(s network.Stream, local, remote ma.Multiaddr, isClient bo
 
 type aliasMode struct {
 	host     host.Host
-	privKey  crypto.PrivKey // nil for dial-only nodes
+	privKey  crypto.PrivKey
 	warpID   string         // empty => dial-only
 	upgrader transport.Upgrader
 

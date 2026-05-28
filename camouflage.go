@@ -311,7 +311,10 @@ func (t *CamouflageTransport) CanDial(addr ma.Multiaddr) bool {
 // Protocols claims /warpid/ unconditionally; the swarm reads this once
 // at AddTransport time. CanDial/Dial/Listen guard until EnableAlias.
 func (t *CamouflageTransport) Protocols() []int {
-	return append(t.inner.Protocols(), P_WARPID)
+	inner := t.inner.Protocols()
+	out := make([]int, len(inner), len(inner)+1)
+	copy(out, inner)
+	return append(out, P_WARPID)
 }
 
 // Proxy returns true so the swarm prefers this transport for multiaddrs
