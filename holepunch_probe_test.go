@@ -154,7 +154,7 @@ func TestHolePunch_CamouflageBothSidesDial(t *testing.T) {
 			out <- res{nil, err}
 			return
 		}
-		spoofed := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, 0)
+		spoofed := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, 0, defaultSNI)
 		cc, err := NewCamouflageConn(spoofed, true, cfg)
 		out <- res{cc, err}
 	}
@@ -191,7 +191,7 @@ func TestHolePunch_CamouflageClientServerControl(t *testing.T) {
 			out <- err
 			return
 		}
-		spoofed := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, 0)
+		spoofed := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, 0, defaultSNI)
 		cc, err := NewCamouflageConn(spoofed, isClient, cfg)
 		if cc != nil {
 			defer cc.Close()
@@ -339,7 +339,7 @@ func TestHolePunch_DefaultHandshakeLatency(t *testing.T) {
 					out <- err
 					return
 				}
-				s := NewSpoofConn(mc, tc.fragSize, DefaultHandshakeLen, tc.maxDelay)
+				s := NewSpoofConn(mc, tc.fragSize, DefaultHandshakeLen, tc.maxDelay, defaultSNI)
 				cc, err := NewCamouflageConn(s, isClient, cfg)
 				if cc != nil {
 					defer cc.Close()

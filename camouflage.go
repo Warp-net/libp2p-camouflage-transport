@@ -31,6 +31,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -341,15 +342,7 @@ func (t *CamouflageTransport) Listen(laddr ma.Multiaddr) (transport.Listener, er
 		gated = t.upgrader.GateMaListener(mal)
 	}
 
-	camouflageList := &camouflageGatedMaListener{
-		GatedMaListener: gated,
-		fragmentSize:    t.fragmentSize,
-		handshakeLen:    t.handshakeLen,
-		maxDelay:        t.maxDelay,
-		camoConfig:      t.camoConfig,
-	}
-
-	return t.upgrader.UpgradeGatedMaListener(t, camouflageList), nil
+	return t.upgrader.UpgradeGatedMaListener(t, newCamouflageGatedMaListener(gated, t)), nil
 }
 
 // CanDial returns true if the transport can dial the given multiaddr.
@@ -372,7 +365,16 @@ func (t *CamouflageTransport) String() string {
 }
 
 func (t *CamouflageTransport) wrapConn(c manet.Conn) *SpoofConn {
-	return NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay)
+	return NewSpoofConn(c, t.fragmentSize, t.handshakeLen, t.maxDelay, t.sni)
+}
+
+const acceptQueueSize = 64
+
+const acceptTimeout = 30 * time.Second
+
+type acceptedConn struct {
+	conn  manet.Conn
+	scope network.ConnManagementScope
 }
 
 type camouflageGatedMaListener struct {
@@ -381,44 +383,126 @@ type camouflageGatedMaListener struct {
 	fragmentSize int
 	handshakeLen int
 	maxDelay     time.Duration
+	sni          string
 	camoConfig   *CamouflageConfig
+
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	queue    chan struct{}
+	connChan chan acceptedConn
 }
 
-func (l *camouflageGatedMaListener) Accept() (manet.Conn, network.ConnManagementScope, error) {
+func newCamouflageGatedMaListener(gated transport.GatedMaListener, t *CamouflageTransport) *camouflageGatedMaListener {
+	ctx, cancel := context.WithCancel(context.Background())
+	l := &camouflageGatedMaListener{
+		GatedMaListener: gated,
+		fragmentSize:    t.fragmentSize,
+		handshakeLen:    t.handshakeLen,
+		maxDelay:        t.maxDelay,
+		sni:             t.sni,
+		camoConfig:      t.camoConfig,
+		ctx:             ctx,
+		cancel:          cancel,
+		queue:           make(chan struct{}, acceptQueueSize),
+		connChan:        make(chan acceptedConn),
+	}
+	l.wg.Add(1)
+	go l.run()
+	return l
+}
+
+func (l *camouflageGatedMaListener) run() {
+	defer l.wg.Done()
+
 	for {
 		conn, scope, err := l.GatedMaListener.Accept()
 		if err != nil {
-			if scope != nil {
-				scope.Done()
-			}
-
-			if err != nil && strings.HasSuffix(err.Error(), "use of closed network connection") {
-				return nil, nil, err
+			releaseScope(scope)
+			if strings.HasSuffix(err.Error(), "use of closed network connection") {
+				return
 			}
 			log.Printf("dpi: transient accept: %v", err)
 			continue
 		}
-
-		setLinger(conn, 0)
-		tryKeepAlive(conn, true)
-
-		// Layer 1: TCP fragmentation for server-side responses.
-		spoofed := NewSpoofConn(conn, l.fragmentSize, l.handshakeLen, l.maxDelay)
-
-		// Layer 2: Real TLS tunnel – server side accepts TLS with a plausible
-		// certificate chain and validates the client's ALPN.
-		camouflaged, err := NewCamouflageConn(spoofed, false, l.camoConfig)
-		if err != nil {
-			log.Printf("dpi: camouflage handshake failed from %s: %v", conn.RemoteAddr(), err)
-			if scope != nil {
-				scope.Done()
-			}
-			_ = conn.Close()
-			continue
-		}
-
-		return camouflaged, scope, nil
+		l.dispatch(conn, scope)
 	}
+}
+
+func (l *camouflageGatedMaListener) dispatch(conn manet.Conn, scope network.ConnManagementScope) {
+	ctx, cancel := context.WithTimeout(l.ctx, acceptTimeout)
+
+	select {
+	case l.queue <- struct{}{}:
+	case <-ctx.Done():
+		cancel()
+		log.Printf("dpi: handshake queue full, dropping %s", conn.RemoteAddr())
+		discard(conn, scope)
+		return
+	}
+
+	l.wg.Add(1)
+	go func() {
+		defer func() { <-l.queue }()
+		defer l.wg.Done()
+		defer cancel()
+
+		l.handshake(ctx, conn, scope)
+	}()
+}
+
+func (l *camouflageGatedMaListener) handshake(
+	ctx context.Context,
+	conn manet.Conn,
+	scope network.ConnManagementScope,
+) {
+	setLinger(conn, 0)
+	tryKeepAlive(conn, true)
+
+	// Layer 1: TCP fragmentation for server-side responses.
+	spoofed := NewSpoofConn(conn, l.fragmentSize, l.handshakeLen, l.maxDelay, l.sni)
+
+	// Layer 2: Real TLS tunnel – server side accepts TLS with a plausible
+	// certificate chain and validates the client's ALPN.
+	camouflaged, err := NewCamouflageConn(spoofed, false, l.camoConfig)
+	if err != nil {
+		log.Printf("dpi: camouflage handshake failed from %s: %v", conn.RemoteAddr(), err)
+		discard(conn, scope)
+		return
+	}
+
+	select {
+	case l.connChan <- acceptedConn{conn: camouflaged, scope: scope}:
+	case <-ctx.Done():
+		discard(camouflaged, scope)
+	}
+}
+
+func releaseScope(scope network.ConnManagementScope) {
+	if scope != nil {
+		scope.Done()
+	}
+}
+
+func discard(conn manet.Conn, scope network.ConnManagementScope) {
+	releaseScope(scope)
+	_ = conn.Close()
+}
+
+func (l *camouflageGatedMaListener) Accept() (manet.Conn, network.ConnManagementScope, error) {
+	select {
+	case c := <-l.connChan:
+		return c.conn, c.scope, nil
+	case <-l.ctx.Done():
+		return nil, nil, transport.ErrListenerClosed
+	}
+}
+
+func (l *camouflageGatedMaListener) Close() error {
+	l.cancel()
+	err := l.GatedMaListener.Close()
+	l.wg.Wait()
+	return err
 }
 
 func setLinger(conn net.Conn, sec int) {

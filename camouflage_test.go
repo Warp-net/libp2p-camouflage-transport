@@ -95,7 +95,7 @@ func (f *fakeConn) writeSizes() []int {
 
 func TestSpoofConn_FragmentsDuringHandshake(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 2, 10, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 2, 10, 0, "") // no delays in tests
 
 	data := []byte("HELLO_WORLD!") // 12 bytes: 10 in handshake + 2 after
 	n, err := sc.Write(data)
@@ -118,7 +118,7 @@ func TestSpoofConn_FragmentsDuringHandshake(t *testing.T) {
 
 func TestSpoofConn_PassthroughAfterHandshake(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 1, 4, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 1, 4, 0, "") // no delays in tests
 
 	// Exhaust the handshake phase.
 	_, err := sc.Write([]byte("ABCD"))
@@ -135,7 +135,7 @@ func TestSpoofConn_PassthroughAfterHandshake(t *testing.T) {
 
 func TestSpoofConn_PartialHandshakeAcrossWrites(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 3, 8, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 3, 8, 0, "") // no delays in tests
 
 	// First write: 5 bytes. Should be fragmented into 3+2 (still in handshake).
 	n, err := sc.Write([]byte("ABCDE"))
@@ -154,7 +154,7 @@ func TestSpoofConn_PartialHandshakeAcrossWrites(t *testing.T) {
 
 func TestSpoofConn_FragmentSizeLargerThanData(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 100, 200, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 100, 200, 0, "") // no delays in tests
 
 	data := []byte("short")
 	n, err := sc.Write(data)
@@ -166,7 +166,7 @@ func TestSpoofConn_FragmentSizeLargerThanData(t *testing.T) {
 
 func TestSpoofConn_EmptyWrite(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 2, 10, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 2, 10, 0, "") // no delays in tests
 
 	n, err := sc.Write(nil)
 	require.NoError(t, err)
@@ -176,7 +176,7 @@ func TestSpoofConn_EmptyWrite(t *testing.T) {
 
 func TestSpoofConn_ZeroFragmentSizeUsesDefault(t *testing.T) {
 	fc := &fakeConn{}
-	sc := NewSpoofConn(fc, 0, 10, 0) // zero triggers fallback to defaultFragmentSize
+	sc := NewSpoofConn(fc, 0, 10, 0, "") // zero triggers fallback to defaultFragmentSize
 
 	data := []byte("ABCDEF") // 6 bytes, should fragment into DefaultFragmentSize (2) chunks
 	n, err := sc.Write(data)
@@ -261,7 +261,7 @@ func (s *shortWriteConn) Write(b []byte) (int, error) {
 
 func TestSpoofConn_ShortWrite(t *testing.T) {
 	fc := &shortWriteConn{maxPerWrite: 1}
-	sc := NewSpoofConn(fc, 3, 10, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 3, 10, 0, "") // no delays in tests
 
 	data := []byte("ABCDEF")
 	n, err := sc.Write(data)
@@ -281,7 +281,7 @@ func (z *zeroWriteConn) Write([]byte) (int, error) {
 
 func TestSpoofConn_ZeroWriteReturnsError(t *testing.T) {
 	fc := &zeroWriteConn{}
-	sc := NewSpoofConn(fc, 2, 10, 0) // no delays in tests
+	sc := NewSpoofConn(fc, 2, 10, 0, "") // no delays in tests
 
 	_, err := sc.Write([]byte("AB"))
 	require.Error(t, err)

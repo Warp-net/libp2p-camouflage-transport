@@ -82,7 +82,7 @@ func captureClientHello(t *testing.T, browser string, fragmentSize, handshakeLen
 	mc, err := manet.WrapNetConn(cap)
 	require.NoError(t, err)
 
-	s := NewSpoofConn(mc, fragmentSize, handshakeLen, 0)
+	s := NewSpoofConn(mc, fragmentSize, handshakeLen, 0, defaultSNI)
 	_, _ = clientTLSHandshake(s, cfg)
 
 	require.NotEmpty(t, cap.writes, "no ClientHello was written")
@@ -108,25 +108,19 @@ func TestFragmentation_SNINeverInOneSegment(t *testing.T) {
 	}
 }
 
-func TestFragmentation_DefaultsCoverWholeClientHello(t *testing.T) {
+func TestFragmentation_ClientHelloLeavesInTwoSegments(t *testing.T) {
 	for _, browser := range []string{BrowserChrome, BrowserFirefox, BrowserSafari, BrowserIOS} {
 		t.Run(browser, func(t *testing.T) {
-			maxSeen := 0
 			for i := 0; i < 10; i++ {
 				cap := captureClientHello(t, browser, DefaultFragmentSize, DefaultHandshakeLen)
-				if n := len(cap.stream()); n > maxSeen {
-					maxSeen = n
-				}
-				for j, w := range cap.writes {
-					require.LessOrEqual(t, len(w), DefaultFragmentSize,
-						"write %d of %d was %d bytes — beyond the fragmented prefix",
-						j, len(cap.writes), len(w))
-				}
+
+				require.Len(t, cap.writes, 2,
+					"iteration %d: the ClientHello must go out as two segments cut inside "+
+						"the SNI; shredding it into many tiny segments is itself a signature",
+					i)
+				assert.Greater(t, len(cap.writes[0]), DefaultFragmentSize,
+					"iteration %d: segments must stay browser-sized", i)
 			}
-			t.Logf("%s: largest ClientHello %d bytes, DefaultHandshakeLen=%d",
-				browser, maxSeen, DefaultHandshakeLen)
-			assert.Less(t, maxSeen, DefaultHandshakeLen,
-				"DefaultHandshakeLen must exceed the largest ClientHello")
 		})
 	}
 }
@@ -143,7 +137,7 @@ func TestFragmentation_DefaultLatencyFitsHolePunchBudget(t *testing.T) {
 			out <- err
 			return
 		}
-		s := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, DefaultMaxDelay)
+		s := NewSpoofConn(mc, DefaultFragmentSize, DefaultHandshakeLen, DefaultMaxDelay, defaultSNI)
 		cc, err := NewCamouflageConn(s, isClient, cfg)
 		if cc != nil {
 			defer cc.Close()
