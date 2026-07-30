@@ -18,9 +18,9 @@
 
 set -euo pipefail
 
-NATLAB_BIN=${NATLAB_BIN:-/usr/local/bin/natlab-harness}
-LOG_DIR=${LOG_DIR:-/var/log/natlab-harness}
-RUN_DIR=${RUN_DIR:-/run/natlab-harness}
+NATLAB_BIN=${NATLAB_BIN:-/usr/local/bin/natlab}
+LOG_DIR=${LOG_DIR:-/var/log/natlab}
+RUN_DIR=${RUN_DIR:-/run/natlab}
 PORT=${PORT:-4001}
 PEER_TIMEOUT=${PEER_TIMEOUT:-180s}
 FORCE_PRIVATE=${FORCE_PRIVATE:-0}
@@ -33,9 +33,9 @@ LAN_A_HOST=10.1.0.2
 LAN_B_GW=10.2.0.1
 LAN_B_HOST=10.2.0.2
 
-RELAY_SEED=natlab-harness-relay
-SEED_A=natlab-harness-peer-a
-SEED_B=natlab-harness-peer-b
+RELAY_SEED=natlab-relay
+SEED_A=natlab-peer-a
+SEED_B=natlab-peer-b
 
 pids=()
 
@@ -118,9 +118,9 @@ echo "  ok: both LANs egress through their NAT"
 
 # ------------------------------------------------------------------- nodes
 
-# natlab-harness takes no command-line flags: warpnet/config parses pflags from its
-# init() and would reject them, so everything goes through the environment.
-# The last line is the ID: warpnet prints a version banner to stdout on init.
+# natlab takes no command-line flags: every role is driven through the
+# environment. tail -n1 guards against anything the libp2p stack may print
+# before the ID.
 peer_id() {
   NATLAB_ROLE=print-id NATLAB_SEED="$1" "$NATLAB_BIN" | tail -n1 | tr -d '[:space:]'
 }

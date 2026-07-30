@@ -1,14 +1,19 @@
 # natlab — end-to-end NAT hole punch harness
 
-Runs a real Warpnet hole punch between two peers sitting behind two independent
+Runs a real hole punch between two peers sitting behind two independent
 `MASQUERADE` NATs. No second machine and no `sudo`: the whole topology lives in
 the network namespace of one privileged container, and `--network none` keeps it
 off every real network, so it can never reach mainnet or testnet.
 
 ```sh
-./deploy/natlab-harness/run.sh                  # build image + run the lab
-FORCE_PRIVATE=1 ./deploy/natlab-harness/run.sh  # skip AutoNAT reachability probing
+./natlab/run.sh                  # build image + run the lab
+FORCE_PRIVATE=1 ./natlab/run.sh  # skip AutoNAT reachability probing
+./natlab/run.sh --shell          # shell in the lab, run topology.sh by hand
 ```
+
+The harness is behind the `natlab` build tag, so it stays out of
+`go build ./...`; the image builds it with `go build -tags natlab ./natlab`.
+`.github/workflows/labs.yml` runs it on every push.
 
 ## Topology
 
@@ -28,8 +33,19 @@ DCUtR is expected to traverse. Unsolicited inbound is dropped silently rather
 than rejected, because a RST would abort the peer's dial instead of letting TCP
 retransmit, and the retransmission is what makes a simultaneous open succeed.
 
-The peers are built from the production `node.CommonOptions`, so the camouflage
-transport, PSK, Noise, AutoNAT v2, AutoRelay and DCUtR are all the real thing.
+The peers are configured the way a Warpnet node is — camouflage transport, PSK,
+Noise, AutoNAT v2, relay service with Warpnet's resource limits, AutoRelay and
+DCUtR are all the real thing. `options.go` mirrors `node.CommonOptions` through
+public libp2p APIs rather than importing warpnet, which is impossible here:
+warpnet depends on this module. The mapping is documented at the top of that
+file, and a change to `CommonOptions` that matters to hole punching has to be
+made in both places.
+
+The PSK is derived from a lab constant instead of Warpnet's network and version.
+What the harness needs is that a PSK is set at all — that is what makes libp2p
+refuse the transport a shared TCP listener, the condition this lab was built to
+catch — and a lab-only PSK also guarantees these peers can never join a real
+network.
 
 ## What it asserts
 

@@ -1,3 +1,5 @@
+//go:build natlab
+
 /*
 
  Warpnet - Decentralized Social Network
@@ -22,15 +24,14 @@ Use at your own risk. The maintainers shall not be liable for any damages or dat
 resulting from the use or misuse of this software.
 */
 
-// natlab-harness is the node side of the NAT hole-punch harness. It builds a libp2p
-// host from the production node.CommonOptions and reports DCUtR progress, so
-// that topology.sh can assert a real hole punch happened between two peers
-// sitting behind two independent MASQUERADE NATs.
+// natlab is the node side of the NAT hole-punch harness. It builds a libp2p
+// host configured the way a Warpnet node is (see options.go) and reports DCUtR
+// progress, so that topology.sh can assert a real hole punch happened between
+// two peers sitting behind two independent MASQUERADE NATs.
 package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,29 +43,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Masterminds/semver/v3"
-	"github.com/Warp-net/warpnet/core/node"
-	"github.com/Warp-net/warpnet/core/warpnet"
-	"github.com/Warp-net/warpnet/security"
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
-	log "github.com/sirupsen/logrus"
 )
 
-// The lab runs on its own PSK so it can never talk to mainnet or testnet.
-const (
-	labNetwork = "natlab-harness"
-	labVersion = "0.0.1"
-)
-
-// Everything is configured through the environment on purpose: importing
-// warpnet/config runs pflag.Parse() from its init(), which rejects any flag of
-// ours before main() is even reached.
+// Everything is configured through the environment, which is what topology.sh
+// drives each role with.
 var (
 	role         = envStr("NATLAB_ROLE", "")
 	seed         = envStr("NATLAB_SEED", "")
@@ -113,10 +103,6 @@ func envDuration(key string, def time.Duration) time.Duration {
 }
 
 func main() {
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.InfoLevel)
-	log.SetFormatter(&log.TextFormatter{FullTimestamp: true, TimestampFormat: time.TimeOnly})
-
 	if role == "print-id" {
 		id, err := peerIDFromSeed(seed)
 		if err != nil {
@@ -272,36 +258,28 @@ func runPeer(ctx context.Context) error {
 	return nil
 }
 
-func newHost(relays []peer.AddrInfo) (warpnet.P2PNode, *hpTracer, error) {
-	privKey, err := security.GenerateKeyFromSeed([]byte(seed))
+func newHost(relays []peer.AddrInfo) (host.Host, *hpTracer, error) {
+	privKey, err := labIdentity(seed)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
-	selfID, err := warpnet.IDFromPublicKey(privKey.Public().(ed25519.PublicKey))
+	selfID, err := peer.IDFromPrivateKey(privKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("derive peer id: %w", err)
-	}
-	version, err := semver.NewVersion(labVersion)
-	if err != nil {
-		return nil, nil, err
-	}
-	psk, err := security.GeneratePSK(labNetwork, version)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate psk: %w", err)
 	}
 
 	tracer := &hpTracer{}
 
 	opts := []libp2p.Option{
-		node.WarpIdentity(privKey),
-		libp2p.PrivateNetwork(warpnet.PSK(psk)),
+		libp2p.Identity(privKey),
+		libp2p.PrivateNetwork(labPSK[:]),
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/%s/tcp/%d", listenIP, listenPort)),
 	}
 	if len(relays) > 0 {
-		opts = append(opts, node.EnableAutoRelayWithStaticRelays(relays, selfID)())
+		opts = append(opts, staticRelays(relays, selfID))
 	}
-	opts = append(opts, node.CommonOptions...)
-	// Re-apply with a tracer: CommonOptions enables hole punching without one,
+	opts = append(opts, commonOptions()...)
+	// Re-apply with a tracer: commonOptions enables hole punching without one,
 	// and the option only overwrites HolePunchingOptions.
 	opts = append(opts, libp2p.EnableHolePunching(holepunch.WithTracer(tracer)))
 	if role == "relay" {
@@ -324,12 +302,12 @@ func newHost(relays []peer.AddrInfo) (warpnet.P2PNode, *hpTracer, error) {
 
 // waitCircuitAddr waits until AutoNAT declares us private and AutoRelay has a
 // confirmed reservation, which is what makes us dialable over the relay.
-func waitCircuitAddr(ctx context.Context, h warpnet.P2PNode) (string, error) {
+func waitCircuitAddr(ctx context.Context, h host.Host) (string, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		for _, a := range h.Addrs() {
-			if !warpnet.IsRelayMultiaddress(a) {
+			if !isRelayAddr(a) {
 				continue
 			}
 			return fmt.Sprintf("%s/p2p/%s", a, h.ID()), nil
@@ -344,7 +322,7 @@ func waitCircuitAddr(ctx context.Context, h warpnet.P2PNode) (string, error) {
 
 // waitDCUtRReady waits until our own host answers the DCUtR protocol, which is
 // the observable proof that hole punching has a public address to work with.
-func waitDCUtRReady(ctx context.Context, h warpnet.P2PNode) error {
+func waitDCUtRReady(ctx context.Context, h host.Host) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -363,12 +341,12 @@ func waitDCUtRReady(ctx context.Context, h warpnet.P2PNode) error {
 
 // waitDirectConn waits for a connection to target that is neither limited nor
 // routed through a relay, i.e. the result of a successful hole punch.
-func waitDirectConn(ctx context.Context, h warpnet.P2PNode, target peer.ID) (network.Conn, error) {
+func waitDirectConn(ctx context.Context, h host.Host, target peer.ID) (network.Conn, error) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		for _, c := range h.Network().ConnsToPeer(target) {
-			if c.Stat().Limited || warpnet.IsRelayMultiaddress(c.RemoteMultiaddr()) {
+			if c.Stat().Limited || isRelayAddr(c.RemoteMultiaddr()) {
 				continue
 			}
 			return c, nil
@@ -391,7 +369,7 @@ func waitDirectConn(ctx context.Context, h warpnet.P2PNode, target peer.ID) (net
 }
 
 // pingOver pings target and verifies libp2p picked the hole-punched connection.
-func pingOver(ctx context.Context, h warpnet.P2PNode, target peer.ID, direct network.Conn) error {
+func pingOver(ctx context.Context, h host.Host, target peer.ID, direct network.Conn) error {
 	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -461,11 +439,11 @@ func (t *hpTracer) Trace(evt *holepunch.Event) {
 func (t *hpTracer) punched() bool { return t.success.Load() }
 
 func peerIDFromSeed(s string) (peer.ID, error) {
-	privKey, err := security.GenerateKeyFromSeed([]byte(s))
+	privKey, err := labIdentity(s)
 	if err != nil {
 		return "", err
 	}
-	return warpnet.IDFromPublicKey(privKey.Public().(ed25519.PublicKey))
+	return peer.IDFromPrivateKey(privKey)
 }
 
 func addrInfo(s string) (*peer.AddrInfo, error) {

@@ -1,0 +1,80 @@
+# The two harnesses that need a real network to say anything: dpilab asks nDPI
+# whether the camouflaged traffic looks like browsing, natlab punches a hole
+# through two independent NATs. Both need CAP_NET_ADMIN, which a GitHub-hosted
+# runner gives us through `docker run --privileged`, and both run with
+# `--network none` so they cannot reach a real Warpnet network.
+name: labs
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: labs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dpilab:
+    name: dpilab - nDPI vs the camouflage transport
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built here rather than by run.sh so the nDPI compile is cached between
+      # runs; run.sh then reuses the image.
+      - name: Build the lab image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dpilab/Dockerfile
+          tags: warpnet-dpilab:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # PORT=443 puts the relays where browsing traffic actually lives, which
+      # also drops nDPI's "Known Proto on Non Std Port" risk, so the run has to
+      # come back with no flow risks at all.
+      - name: Run the lab (relays on 443, camouflage + control arm)
+        env:
+          SKIP_BUILD: 1
+          PORT: 443
+          OUT: ${{ runner.temp }}/dpilab
+        run: ./dpilab/run.sh
+
+      - name: Upload captures and nDPI output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dpilab-${{ github.run_id }}
+          path: ${{ runner.temp }}/dpilab
+          if-no-files-found: warn
+          retention-days: 7
+
+  natlab:
+    name: natlab - NAT hole punch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the lab image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: natlab/Dockerfile
+          tags: warpnet-natlab:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the lab
+        env:
+          SKIP_BUILD: 1
+        run: ./natlab/run.sh

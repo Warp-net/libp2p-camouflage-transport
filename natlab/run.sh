@@ -5,19 +5,24 @@
 # its own network namespace. --network none keeps the lab off every real
 # network, so nothing can reach mainnet, testnet or the host LAN.
 #
-#   ./deploy/natlab-harness/run.sh                 # build + run
-#   FORCE_PRIVATE=1 ./deploy/natlab-harness/run.sh # skip AutoNAT reachability probing
-#   ./deploy/natlab-harness/run.sh --shell         # interactive shell in the lab
+#   ./natlab/run.sh                 # build + run
+#   FORCE_PRIVATE=1 ./natlab/run.sh # skip AutoNAT reachability probing
+#   ./natlab/run.sh --shell         # interactive shell in the lab
 
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 image=${IMAGE:-warpnet-natlab:latest}
 
 cd "$repo_root"
 
-echo "== building $image"
-docker build -f deploy/natlab/Dockerfile -t "$image" .
+# CI builds the image itself to get layer caching, then sets SKIP_BUILD=1.
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  echo "== using prebuilt $image"
+else
+  echo "== building $image"
+  docker build -f natlab/Dockerfile -t "$image" .
+fi
 
 run_args=(
   --rm
